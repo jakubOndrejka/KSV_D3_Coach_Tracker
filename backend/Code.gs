@@ -11,7 +11,7 @@
  */
 
 const KSV = {
-  VERSION: '1.0.1',
+  VERSION: '1.0.3',
   DEFAULT_SEASON_START: '2026-08-01',
   SESSION_HOURS: 12,
   DEFAULT_LOOKBACK_DAYS: 21,
@@ -189,7 +189,13 @@ function bootstrap_() {
   const seasonStart = PropertiesService.getScriptProperties().getProperty('SEASON_START') || KSV.DEFAULT_SEASON_START;
   const players = readObjects_('Players').filter(r => bool_(r.include_in_tracker) && boolDefaultTrue_(r.active));
   const playerIds = new Set(players.map(p => String(p.id)));
-  const events = readObjects_('Events').filter(e => !e.start_time || String(e.start_time) >= seasonStart);
+  const seasonStartDate = parseHoldsportDate_(seasonStart + 'T00:00:00');
+  const events = readObjects_('Events').filter(e => {
+    if (!e.start_time) return true;
+    const d = parseHoldsportDate_(e.start_time);
+    // If a legacy/raw value cannot be parsed, keep it visible rather than silently hiding it.
+    return !d || !seasonStartDate || d.getTime() >= seasonStartDate.getTime();
+  });
   const eventIds = new Set(events.map(e => String(e.id)));
 
   const participation = readObjects_('Participation').filter(r => eventIds.has(String(r.event_id)) && playerIds.has(String(r.player_id)));
@@ -218,9 +224,14 @@ function bootstrap_() {
 }
 
 function discoverTeams_() {
-  const teams = holdsportFetch_('/v1/teams');
-  if (!Array.isArray(teams)) throw new Error('Unexpected Holdsport teams response.');
-  return teams.map(t => ({ id: t.id, name: t.name, role: t.role }));
+  const raw = holdsportFetch_('/v1/teams');
+  const teams = holdsportArray_(raw, ['teams', 'data', 'items']);
+  if (!teams) throw new Error('Unexpected Holdsport teams response. Top-level keys: ' + responseKeys_(raw));
+  return teams.map(t => ({
+    id: firstDefined_(t.id, t.team_id, t.team && t.team.id),
+    name: String(firstDefined_(t.name, t.team_name, t.team && t.team.name, 'Unnamed team')),
+    role: firstDefined_(t.role, t.team_role, t.membership && t.membership.role, '')
+  })).filter(t => t.id !== undefined && t.id !== null && String(t.id) !== '');
 }
 
 function setTeamId_(data) {
@@ -238,68 +249,87 @@ function syncHoldsport_() {
     const teamId = props.getProperty('HOLDSPORT_TEAM_ID');
     if (!teamId) throw new Error('HOLDSPORT_TEAM_ID is not configured. Use Settings → Discover teams in the web app.');
 
-    const members = holdsportFetch_('/v1/teams/' + encodeURIComponent(teamId) + '/members');
-    if (!Array.isArray(members)) throw new Error('Unexpected Holdsport members response.');
+    const rawMembers = holdsportFetch_('/v1/teams/' + encodeURIComponent(teamId) + '/members');
+    const members = holdsportArray_(rawMembers, ['members', 'team_members', 'users', 'data', 'items']);
+    if (!members) throw new Error('Unexpected Holdsport members response. Top-level keys: ' + responseKeys_(rawMembers));
 
     const existingPlayers = indexBy_(readObjects_('Players'), 'id');
-    const playerRows = members.map(m => {
-      const id = 'p_' + String(m.id);
+    const playerRows = [];
+    members.forEach(m => {
+      const memberId = holdsportMemberId_(m);
+      if (memberId === '') return;
+      const id = 'p_' + memberId;
       const old = existingPlayers[id] || {};
-      return {
+      const parsedName = holdsportMemberName_(m);
+      playerRows.push({
         id: id,
-        holdsport_user_id: String(m.id),
-        name: String(m.name || '').trim(),
-        role: m.role,
-        role_name: roleName_(m.role),
+        holdsport_user_id: memberId,
+        name: parsedName || old.name || ('Holdsport member ' + memberId),
+        role: firstDefined_(m.role, m.team_role, m.membership && m.membership.role, ''),
+        role_name: roleName_(firstDefined_(m.role, m.team_role, m.membership && m.membership.role, '')),
+        // Holdsport's documented `role` is team role (player/coach), not volleyball position.
+        // If the club exposes a custom field such as Position/Spillerposition, import it once;
+        // otherwise preserve the coach-entered position already stored in the tracker.
+        position: old.position || extractHoldsportPosition_(m) || '',
         include_in_tracker: old.include_in_tracker !== '' && old.include_in_tracker !== undefined
           ? old.include_in_tracker
-          : defaultIncludeForRole_(m.role),
+          : defaultIncludeForRole_(firstDefined_(m.role, m.team_role, m.membership && m.membership.role, 1)),
         active: old.active !== '' && old.active !== undefined ? old.active : true,
         created_at: old.created_at || nowIso_(),
         updated_at: nowIso_()
-      };
+      });
     });
     upsertMany_('Players', playerRows);
 
     const lookback = numberProperty_('SYNC_LOOKBACK_DAYS', KSV.DEFAULT_LOOKBACK_DAYS);
-    const lookahead = numberProperty_('SYNC_LOOKAHEAD_DAYS', KSV.DEFAULT_LOOKAHEAD_DAYS);
     const tz = Session.getScriptTimeZone() || KSV.DEFAULT_TIMEZONE;
     const fromDate = new Date(Date.now() - lookback * 86400000);
-    const endDate = new Date(Date.now() + lookahead * 86400000);
     const dateParam = Utilities.formatDate(fromDate, tz, 'yyyy-MM-dd');
 
+    // The Holdsport API already supports `date=...` (from this day onward). Do not apply
+    // an additional short look-ahead filter here: sparse calendars or parsing differences
+    // could otherwise make perfectly valid activities disappear from the tracker.
     let activities = [];
-    for (let page = 1; page <= 10; page++) {
-      const arr = holdsportFetch_(
+    let activitySchema = '';
+    for (let page = 1; page <= 20; page++) {
+      const rawActivities = holdsportFetch_(
         '/v1/teams/' + encodeURIComponent(teamId) + '/activities?date=' + encodeURIComponent(dateParam) + '&page=' + page + '&per_page=50'
       );
-      if (!Array.isArray(arr) || arr.length === 0) break;
+      const arr = holdsportArray_(rawActivities, ['activities', 'data', 'items', 'results']);
+      if (!arr) {
+        activitySchema = responseKeys_(rawActivities);
+        break;
+      }
+      if (arr.length === 0) break;
       activities = activities.concat(arr);
       if (arr.length < 50) break;
     }
 
-    activities = activities.filter(a => {
-      const d = parseDateSafe_(a.starttime);
-      return d && d <= endDate;
-    });
+    // Keep activities even if a date is malformed. We normalize known Holdsport date formats
+    // for the browser, but never silently drop an activity solely because a date parser failed.
+    const unparseableActivities = activities.filter(a => !parseHoldsportDate_(holdsportActivityStart_(a))).length;
 
     const existingEvents = indexBy_(readObjects_('Events'), 'id');
-    const eventRows = activities.map(a => {
-      const id = 'e_' + String(a.id);
+    const eventRows = [];
+    activities.forEach(a => {
+      const activityId = holdsportActivityId_(a);
+      if (activityId === '') return;
+      const id = 'e_' + activityId;
       const old = existingEvents[id] || {};
-      return {
+      const activityName = String(firstDefined_(a.name, a.title, a.activity_name, 'Untitled activity'));
+      eventRows.push({
         id: id,
-        holdsport_activity_id: String(a.id),
-        name: String(a.name || 'Untitled activity'),
-        auto_type: classifyEventType_(a.name),
-        start_time: a.starttime || '',
-        end_time: a.endtime || '',
-        meeting_time: a.pickup_time || old.meeting_time || '',
-        place: a.place || '',
+        holdsport_activity_id: activityId,
+        name: activityName,
+        auto_type: classifyEventType_(activityName),
+        start_time: normalizeHoldsportDateForStorage_(holdsportActivityStart_(a)),
+        end_time: normalizeHoldsportDateForStorage_(firstDefined_(a.endtime, a.end_time, a.ends_at, a.end_at, '')),
+        meeting_time: normalizeHoldsportDateForStorage_(firstDefined_(a.pickup_time, a.meeting_time, old.meeting_time, '')) || String(old.meeting_time || ''),
+        place: String(firstDefined_(a.place, a.location, a.venue, '')),
         source: 'holdsport',
-        raw_status: a.status || '',
+        raw_status: String(firstDefined_(a.status, a.rsvp_status, '')),
         synced_at: nowIso_()
-      };
+      });
     });
     upsertMany_('Events', eventRows);
 
@@ -314,28 +344,35 @@ function syncHoldsport_() {
     const dutyRows = [];
 
     activities.forEach(activity => {
-      const eventId = 'e_' + String(activity.id);
-      let activityUsers = Array.isArray(activity.activities_users) && activity.activities_users.length
-        ? activity.activities_users
-        : null;
-      if (!activityUsers) {
+      const activityId = holdsportActivityId_(activity);
+      if (activityId === '') return;
+      const eventId = 'e_' + activityId;
+
+      let activityUsers = holdsportArray_(activity.activities_users, ['activities_users', 'users', 'data', 'items']);
+      if (!activityUsers || !activityUsers.length) {
         try {
-          activityUsers = holdsportFetch_('/v1/activities/' + encodeURIComponent(activity.id) + '/activities_users');
+          const rawUsers = holdsportFetch_('/v1/activities/' + encodeURIComponent(activityId) + '/activities_users');
+          activityUsers = holdsportArray_(rawUsers, ['activities_users', 'users', 'data', 'items']) || [];
         } catch (err) {
           activityUsers = [];
         }
       }
-      if (!Array.isArray(activityUsers)) activityUsers = [];
 
-      const noRsvp = Array.isArray(activity.no_rsvp) ? activity.no_rsvp : [];
+      const noRsvp = holdsportArray_(firstDefined_(activity.no_rsvp, activity.no_response, activity.no_responses, []), ['no_rsvp', 'users', 'data', 'items']) || [];
       const userMap = {};
-      activityUsers.forEach(u => { if (u && u.user_id !== undefined) userMap[String(u.user_id)] = u; });
+      activityUsers.forEach(u => {
+        const uid = holdsportActivityUserId_(u);
+        if (uid !== '') userMap[uid] = u;
+      });
       const noRsvpMap = {};
-      noRsvp.forEach(u => { if (u && u.id !== undefined) noRsvpMap[String(u.id)] = u; });
+      noRsvp.forEach(u => {
+        const uid = holdsportMemberId_(u);
+        if (uid !== '') noRsvpMap[uid] = u;
+      });
 
       allPlayers.forEach(player => {
         const uid = String(player.holdsport_user_id);
-        const partId = 'part_' + String(activity.id) + '_' + uid;
+        const partId = 'part_' + activityId + '_' + uid;
         const old = existingParticipation[partId] || {};
         const explicit = userMap[uid];
         const undecided = noRsvpMap[uid];
@@ -352,13 +389,12 @@ function syncHoldsport_() {
         let newStatusUpdatedAt = '';
 
         if (explicit) {
-          newStatusRaw = String(explicit.status || 'attending');
+          newStatusRaw = String(firstDefined_(explicit.status, explicit.rsvp_status, explicit.joined_status, 'attending'));
           newStatusNorm = normalizeHoldsportStatus_(newStatusRaw);
-          newStatusUpdatedAt = explicit.updated_at || '';
+          newStatusUpdatedAt = String(firstDefined_(explicit.updated_at, explicit.changed_at, explicit.modified_at, ''));
         } else if (undecided) {
           newStatusRaw = 'no_rsvp';
           newStatusNorm = 'undecided';
-          newStatusUpdatedAt = '';
         } else if (!old.holdsport_status) {
           newStatusRaw = 'not_seen';
           newStatusNorm = 'unknown';
@@ -388,28 +424,29 @@ function syncHoldsport_() {
       });
 
       try {
-        const tasks = holdsportFetch_('/v1/activities/' + encodeURIComponent(activity.id) + '/activity_tasks');
-        if (Array.isArray(tasks)) {
-          tasks.forEach(task => {
-            const assignments = Array.isArray(task.activity_tasks) ? task.activity_tasks : [];
-            assignments.forEach(a => {
-              const player = byHoldsportId[String(a.user_id)];
-              if (!player) return;
-              const dutyId = 'duty_' + String(activity.id) + '_' + String(task.id) + '_' + String(a.user_id);
-              const oldDuty = existingDuties[dutyId] || {};
-              dutyRows.push({
-                id: dutyId,
-                event_id: eventId,
-                player_id: player.id,
-                duty_name: String(task.name || 'Duty'),
-                holdsport_task_id: String(task.id),
-                status: oldDuty.status || 'assigned',
-                source: 'holdsport',
-                updated_at: nowIso_()
-              });
+        const rawTasks = holdsportFetch_('/v1/activities/' + encodeURIComponent(activityId) + '/activity_tasks');
+        const tasks = holdsportArray_(rawTasks, ['activity_tasks', 'tasks', 'data', 'items']) || [];
+        tasks.forEach(task => {
+          const assignments = holdsportArray_(firstDefined_(task.activity_tasks, task.assignments, task.users, []), ['activity_tasks', 'assignments', 'users', 'data', 'items']) || [];
+          assignments.forEach(a => {
+            const uid = String(firstDefined_(a.user_id, a.member_id, a.user && a.user.id, ''));
+            const player = byHoldsportId[uid];
+            if (!player) return;
+            const taskId = String(firstDefined_(task.id, task.task_type_id, task.task_id, 'task'));
+            const dutyId = 'duty_' + activityId + '_' + taskId + '_' + uid;
+            const oldDuty = existingDuties[dutyId] || {};
+            dutyRows.push({
+              id: dutyId,
+              event_id: eventId,
+              player_id: player.id,
+              duty_name: String(firstDefined_(task.name, task.title, 'Duty')),
+              holdsport_task_id: taskId,
+              status: oldDuty.status || 'assigned',
+              source: 'holdsport',
+              updated_at: nowIso_()
             });
           });
-        }
+        });
       } catch (err) {
         // Duties are useful but non-critical. Keep sync running if this endpoint differs for a team/account.
       }
@@ -419,15 +456,56 @@ function syncHoldsport_() {
     if (historyRows.length) appendObjects_('RsvpHistory', historyRows);
     if (dutyRows.length) upsertMany_('Duties', dutyRows);
 
-    const message = 'Synced ' + members.length + ' members and ' + activities.length + ' activities.';
+    let message = 'Synced ' + playerRows.length + ' members and ' + eventRows.length + ' activities.';
+    if (unparseableActivities) message += ' ' + unparseableActivities + ' activity date(s) could not be normalized and were kept with their raw value.';
+    if (!eventRows.length && activitySchema) message += ' Activities response keys: ' + activitySchema + '.';
+    if (!eventRows.length) message += ' Holdsport returned no usable activities from ' + dateParam + ' onward.';
     logSync_('holdsport', true, message);
-    return { ok: true, message: message, members: members.length, activities: activities.length };
+    return { ok: true, message: message, members: playerRows.length, activities: eventRows.length };
   } catch (err) {
     logSync_('holdsport', false, err && err.message ? err.message : String(err));
     throw err;
   } finally {
     lock.releaseLock();
   }
+}
+
+/**
+ * Safe diagnostic: run manually in Apps Script if a live Holdsport account still
+ * does not import correctly. It logs only counts and field names, not names,
+ * emails, phone numbers or credentials.
+ */
+function debugHoldsportSchema() {
+  const props = PropertiesService.getScriptProperties();
+  const teamId = props.getProperty('HOLDSPORT_TEAM_ID');
+  if (!teamId) throw new Error('HOLDSPORT_TEAM_ID is not configured.');
+  const rawMembers = holdsportFetch_('/v1/teams/' + encodeURIComponent(teamId) + '/members');
+  const members = holdsportArray_(rawMembers, ['members', 'team_members', 'users', 'data', 'items']) || [];
+  const tz = Session.getScriptTimeZone() || KSV.DEFAULT_TIMEZONE;
+  const fromDate = new Date(Date.now() - numberProperty_('SYNC_LOOKBACK_DAYS', KSV.DEFAULT_LOOKBACK_DAYS) * 86400000);
+  const dateParam = Utilities.formatDate(fromDate, tz, 'yyyy-MM-dd');
+  const rawActivities = holdsportFetch_('/v1/teams/' + encodeURIComponent(teamId) + '/activities?date=' + encodeURIComponent(dateParam) + '&page=1&per_page=5');
+  const activities = holdsportArray_(rawActivities, ['activities', 'data', 'items', 'results']) || [];
+  const diagnostic = {
+    version: KSV.VERSION,
+    member_count: members.length,
+    member_top_level: responseKeys_(rawMembers),
+    first_member_keys: members.length ? Object.keys(members[0]).sort() : [],
+    first_member_nested_user_keys: members.length && members[0].user && typeof members[0].user === 'object' ? Object.keys(members[0].user).sort() : [],
+    activity_count_first_page: activities.length,
+    activity_top_level: responseKeys_(rawActivities),
+    first_activity_keys: activities.length ? Object.keys(activities[0]).sort() : [],
+    activity_start_samples: activities.slice(0, 5).map(a => ({
+      raw_type: typeof holdsportActivityStart_(a),
+      raw: String(holdsportActivityStart_(a) || '').slice(0, 80),
+      normalized: normalizeHoldsportDateForStorage_(holdsportActivityStart_(a)),
+      parsed_ok: !!parseHoldsportDate_(holdsportActivityStart_(a))
+    })),
+    first_member_club_fields_shape: members.length ? describeShape_(members[0].club_fields, 0) : null,
+    first_member_position_guess: members.length ? extractHoldsportPosition_(members[0]) : ''
+  };
+  Logger.log(JSON.stringify(diagnostic, null, 2));
+  return diagnostic;
 }
 
 function bulkPresent_(data) {
@@ -598,6 +676,149 @@ function setPlayerMeta_(data) {
   if (Object.prototype.hasOwnProperty.call(data, 'active')) update.active = bool_(data.active);
   upsertMany_('Players', [update]);
   return update;
+}
+
+function holdsportArray_(value, candidateKeys) {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== 'object') return null;
+  const keys = candidateKeys || [];
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (Array.isArray(value[key])) return value[key];
+    if (value[key] && typeof value[key] === 'object') {
+      const nested = holdsportArray_(value[key], keys);
+      if (nested) return nested;
+    }
+  }
+  // Common generic wrappers not always documented by legacy APIs.
+  const generic = ['data', 'result', 'results', 'response'];
+  for (let i = 0; i < generic.length; i++) {
+    const key = generic[i];
+    if (Array.isArray(value[key])) return value[key];
+    if (value[key] && typeof value[key] === 'object') {
+      const nested = holdsportArray_(value[key], candidateKeys);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+function firstDefined_() {
+  for (let i = 0; i < arguments.length; i++) {
+    const v = arguments[i];
+    if (v !== undefined && v !== null && String(v) !== '') return v;
+  }
+  return '';
+}
+
+function responseKeys_(value) {
+  if (Array.isArray(value)) return '[array]';
+  if (!value || typeof value !== 'object') return '[' + typeof value + ']';
+  return Object.keys(value).sort().join(', ') || '[empty object]';
+}
+
+function holdsportMemberId_(m) {
+  if (!m || typeof m !== 'object') return '';
+  return String(firstDefined_(m.id, m.user_id, m.member_id, m.profile_id, m.user && m.user.id, m.profile && m.profile.id, ''));
+}
+
+function holdsportMemberName_(m) {
+  if (!m || typeof m !== 'object') return '';
+  const direct = firstDefined_(m.name, m.full_name, m.display_name);
+  if (direct) return String(direct).trim();
+  const first = firstDefined_(m.firstname, m.first_name, m.user && firstDefined_(m.user.firstname, m.user.first_name), m.profile && firstDefined_(m.profile.firstname, m.profile.first_name));
+  const last = firstDefined_(m.lastname, m.last_name, m.user && firstDefined_(m.user.lastname, m.user.last_name), m.profile && firstDefined_(m.profile.lastname, m.profile.last_name));
+  const combined = (String(first || '') + ' ' + String(last || '')).trim();
+  if (combined) return combined;
+  return String(firstDefined_(m.user && firstDefined_(m.user.name, m.user.full_name, m.user.display_name), m.profile && firstDefined_(m.profile.name, m.profile.full_name, m.profile.display_name), '')).trim();
+}
+
+function extractHoldsportPosition_(m) {
+  if (!m || typeof m !== 'object') return '';
+
+  const direct = firstDefined_(m.position, m.player_position, m.volleyball_position, m.sport_position);
+  if (direct) return canonicalVolleyballPosition_(direct);
+
+  const fields = m.club_fields;
+  const labelRe = /(^|[^a-z])(position|player\s*position|volleyball\s*position|spillerposition|spiller\s*position|pos)([^a-z]|$)/i;
+
+  function simpleValue(v) {
+    if (v === null || v === undefined) return '';
+    if (['string', 'number'].includes(typeof v)) return String(v).trim();
+    return '';
+  }
+
+  function walk(node, depth) {
+    if (depth > 5 || node === null || node === undefined) return '';
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) {
+        const hit = walk(node[i], depth + 1);
+        if (hit) return hit;
+      }
+      return '';
+    }
+    if (typeof node !== 'object') return '';
+
+    const label = String(firstDefined_(node.label, node.name, node.title, node.key, node.field_name, node.club_field_name, '')).trim();
+    if (label && labelRe.test(label)) {
+      const candidate = firstDefined_(node.value, node.answer, node.content, node.text, node.field_value, node.club_field_value, '');
+      const val = simpleValue(candidate);
+      if (val) return val;
+    }
+
+    const keys = Object.keys(node);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      if (labelRe.test(k)) {
+        const val = simpleValue(node[k]);
+        if (val) return val;
+      }
+    }
+    for (let i = 0; i < keys.length; i++) {
+      const hit = walk(node[keys[i]], depth + 1);
+      if (hit) return hit;
+    }
+    return '';
+  }
+
+  return canonicalVolleyballPosition_(walk(fields, 0));
+}
+
+function canonicalVolleyballPosition_(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  const s = normalizeText_(raw);
+  if (/^(s|setter|haever|haeveren)$/.test(s)) return 'S';
+  if (/^(l|libero)$/.test(s)) return 'L';
+  if (/^(mb|middle|middle blocker|center|centre|midt|midter)$/.test(s)) return 'MB';
+  if (/^(opp|opposite|diagonal|diagonalspiller)$/.test(s)) return 'OPP';
+  if (/^(oh|outside|outside hitter|wing|wing spiker|kant|kantspiller)$/.test(s)) return 'OH';
+  return raw.slice(0, 40);
+}
+
+function describeShape_(value, depth) {
+  if (depth > 3) return '[max-depth]';
+  if (value === null) return null;
+  if (Array.isArray(value)) return value.length ? ['array', describeShape_(value[0], depth + 1)] : ['array'];
+  if (typeof value !== 'object') return typeof value;
+  const out = {};
+  Object.keys(value).slice(0, 20).forEach(k => { out[k] = describeShape_(value[k], depth + 1); });
+  return out;
+}
+
+function holdsportActivityId_(a) {
+  if (!a || typeof a !== 'object') return '';
+  return String(firstDefined_(a.id, a.activity_id, a.activity && a.activity.id, ''));
+}
+
+function holdsportActivityStart_(a) {
+  if (!a || typeof a !== 'object') return '';
+  return String(firstDefined_(a.starttime, a.start_time, a.starts_at, a.start_at, a.datetime, a.date_time, ''));
+}
+
+function holdsportActivityUserId_(u) {
+  if (!u || typeof u !== 'object') return '';
+  return String(firstDefined_(u.user_id, u.member_id, u.profile_id, u.user && u.user.id, u.profile && u.profile.id, ''));
 }
 
 function holdsportFetch_(path) {
@@ -877,9 +1098,56 @@ function normalizeText_(value) {
   return s;
 }
 
+function parseHoldsportDate_(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (Object.prototype.toString.call(value) === '[object Date]') {
+    return isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const ms = value < 100000000000 ? value * 1000 : value;
+    const d = new Date(ms);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  const raw = String(value).trim();
+  if (!raw) return null;
+
+  // Unix timestamps supplied as strings.
+  if (/^\d{10,13}$/.test(raw)) {
+    const n = Number(raw);
+    const d = new Date(raw.length <= 10 ? n * 1000 : n);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  // Official Holdsport format is ISO 8601, e.g. 2026-09-25T19:30:00+02:00.
+  let d = new Date(raw);
+  if (!isNaN(d.getTime())) return d;
+
+  // Be defensive about common API/locale variants.
+  let m = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (m) {
+    d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), Number(m[6] || 0));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  m = raw.match(/^(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{4})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+  if (m) {
+    d = new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]), Number(m[4] || 0), Number(m[5] || 0), Number(m[6] || 0));
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  return null;
+}
+
+function normalizeHoldsportDateForStorage_(value) {
+  if (value === null || value === undefined || value === '') return '';
+  const d = parseHoldsportDate_(value);
+  return d ? d.toISOString() : String(value).trim();
+}
+
 function parseDateSafe_(value) {
-  const d = new Date(value);
-  return isNaN(d.getTime()) ? null : d;
+  return parseHoldsportDate_(value);
 }
 
 function nowIso_() {

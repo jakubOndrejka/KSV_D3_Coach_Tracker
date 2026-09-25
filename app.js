@@ -303,7 +303,7 @@
 
   function renderSession() {
     ensureSelectedEvent();
-    const events = sortedEvents().filter(e => daysUntil(e.start_time) > -45 && daysUntil(e.start_time) < 90);
+    const events = sortedEvents().filter(e => daysUntil(e.start_time) > -180 && daysUntil(e.start_time) < 400);
     const event = eventById(state.selectedEventId);
     if (!event) {
       app.innerHTML = `<section class="page-heading"><div><p class="eyebrow">SESSION MODE</p><h1>No event selected</h1></div></section><button class="primary" id="manualEventBtn">Add manual event</button>`;

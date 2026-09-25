@@ -28,9 +28,9 @@ The app intentionally does **not** calculate a universal player score or automat
 - Coach-only app password; Holdsport credentials never enter the GitHub repository.
 
 
-## v1.0.1 transport fix
+## v1.0.3 transport fix
 
-This package includes a fix for Apps Script HTML Service's nested iframe behavior. The original v1.0.0 bridge could successfully process a login on the backend but never deliver the response back to GitHub Pages, causing a 30-second **Backend request timed out** message. Version 1.0.1 sends the bridge reply to the top page and validates it with a per-request random bridge key.
+This package includes a fix for Apps Script HTML Service's nested iframe behavior. The original v1.0.0 bridge could successfully process a login on the backend but never deliver the response back to GitHub Pages, causing a 30-second **Backend request timed out** message. Version 1.0.3 sends the bridge reply to the top page and validates it with a per-request random bridge key.
 
 ## Fast start
 
