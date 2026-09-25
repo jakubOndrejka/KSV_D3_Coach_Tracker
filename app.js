@@ -17,8 +17,13 @@
     selectedPlayerId: '',
     playerWindow: 30,
     demo: false,
-    busy: false
+    busy: false,
+    pendingParticipation: {},
+    saveTimer: null,
+    saveInFlight: false
   };
+
+  const PENDING_PARTICIPATION_KEY = 'ksvTracker.pendingParticipation.v1';
 
   const OBS_PRESETS = [
     ['communication', 'Did not communicate an important availability change', false],
@@ -83,6 +88,7 @@
     else if (state.demo) statusEl.textContent = 'Demo mode';
     else if (state.data) statusEl.textContent = 'Connected';
     else statusEl.textContent = window.ksvApi.getToken() ? 'Connected' : 'Locked';
+    if (!on) updateSaveIndicator();
   }
 
   async function runBusy(label, fn) {
@@ -98,6 +104,105 @@
         toast(err.message || String(err), 'error');
       }
     } finally { setBusy(false); }
+  }
+
+
+  function loadPendingParticipation() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(PENDING_PARTICIPATION_KEY) || '{}');
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch (_) { return {}; }
+  }
+
+  function persistPendingParticipation() {
+    try {
+      const keys = Object.keys(state.pendingParticipation || {});
+      if (keys.length) localStorage.setItem(PENDING_PARTICIPATION_KEY, JSON.stringify(state.pendingParticipation));
+      else localStorage.removeItem(PENDING_PARTICIPATION_KEY);
+    } catch (_) {}
+  }
+
+  function participationQueueKey(update) {
+    return `${String(update.event_id || '')}|${String(update.player_id || '')}`;
+  }
+
+  function stripClientFields(update) {
+    const out = {};
+    Object.keys(update || {}).forEach(k => { if (!k.startsWith('_')) out[k] = update[k]; });
+    return out;
+  }
+
+  function applyPendingParticipationToState() {
+    if (!state.data) return;
+    Object.values(state.pendingParticipation || {}).forEach(entry => mergeLocalParticipation(stripClientFields(entry)));
+  }
+
+  function updateSaveIndicator() {
+    if (state.busy || state.demo) return;
+    const pending = Object.keys(state.pendingParticipation || {}).length;
+    if (state.saveInFlight) statusEl.textContent = pending > 1 ? `Saving ${pending} changes…` : 'Saving…';
+    else if (pending && !navigator.onLine) statusEl.textContent = `${pending} pending · offline`;
+    else if (pending) statusEl.textContent = `${pending} pending save${pending === 1 ? '' : 's'}`;
+    else if (state.data) statusEl.textContent = 'Connected';
+  }
+
+  function queueParticipationWrites(updates, options = {}) {
+    const list = (updates || []).filter(u => u && u.event_id && u.player_id);
+    if (!list.length) return;
+    list.forEach(update => {
+      const key = participationQueueKey(update);
+      const prev = state.pendingParticipation[key] || {};
+      state.pendingParticipation[key] = {
+        ...prev,
+        ...stripClientFields(update),
+        _seq: `${Date.now()}_${Math.random().toString(36).slice(2)}`
+      };
+      mergeLocalParticipation(stripClientFields(update));
+    });
+    persistPendingParticipation();
+    if (options.render !== false) {
+      if (state.tab === 'session') renderSession();
+      else render();
+    }
+    updateSaveIndicator();
+    scheduleParticipationFlush(options.flushNow ? 0 : 650);
+  }
+
+  function scheduleParticipationFlush(delay = 650) {
+    clearTimeout(state.saveTimer);
+    state.saveTimer = setTimeout(() => flushPendingParticipation(), delay);
+  }
+
+  async function flushPendingParticipation() {
+    if (state.demo || state.saveInFlight || !navigator.onLine || !window.ksvApi.getToken()) {
+      updateSaveIndicator();
+      return;
+    }
+    const keys = Object.keys(state.pendingParticipation || {});
+    if (!keys.length) { updateSaveIndicator(); return; }
+
+    const snapshot = keys.map(key => ({ key, seq: state.pendingParticipation[key]._seq, data: stripClientFields(state.pendingParticipation[key]) }));
+    state.saveInFlight = true;
+    updateSaveIndicator();
+    try {
+      await window.ksvApi.call('batchUpdateParticipation', { updates: snapshot.map(x => x.data) });
+      snapshot.forEach(item => {
+        if (state.pendingParticipation[item.key]?._seq === item.seq) delete state.pendingParticipation[item.key];
+      });
+      persistPendingParticipation();
+      if (Object.keys(state.pendingParticipation).length) scheduleParticipationFlush(250);
+    } catch (err) {
+      console.error(err);
+      if (/session/i.test(err.message || '')) {
+        window.ksvApi.clearToken();
+        renderLogin('Your session expired. Unsaved attendance changes are kept locally and will retry after sign-in.');
+      } else {
+        toast('Could not reach the backend. Changes are kept locally and will retry.', 'warn');
+      }
+    } finally {
+      state.saveInFlight = false;
+      updateSaveIndicator();
+    }
   }
 
   function showNav(show) { nav.hidden = !show; }
@@ -143,6 +248,13 @@
 
   function isRsvpIssue(status) {
     return ['undecided','unknown'].includes(String(status || 'unknown'));
+  }
+
+  function isExplicitlyNotExpected(status, eventType) {
+    const s = String(status || 'unknown');
+    if (['declined','unavailable','vacation'].includes(s)) return true;
+    if (s === 'injured' && eventType !== 'match') return true;
+    return false;
   }
 
   function isRelevantParticipation(p, event) {
@@ -327,6 +439,18 @@
     return `<td title="${esc(title)}"><span class="heat ${tuple[0]}">${esc(tuple[1])}</span></td>`;
   }
 
+  function eventDutyCapacity(event) {
+    const types = dutyTypesForEvent(event.id);
+    const secretary = types.find(t => /secretary|sekret|table|score/i.test(String(t.duty_name || '')) && Number(t.max_participants) > 0);
+    if (secretary) return Number(secretary.max_participants);
+    const anyConfigured = types.find(t => Number(t.max_participants) > 0);
+    if (anyConfigured) return Number(anyConfigured.max_participants);
+    const eventCapacity = Number(event.max_attendees || 0);
+    // Holdsport commonly uses 999 as an effectively-unlimited sentinel.
+    if (eventCapacity > 0 && eventCapacity < 100) return eventCapacity;
+    return 2;
+  }
+
   function renderSession() {
     ensureSelectedEvent();
     const events = sortedEvents().filter(e => daysUntil(e.start_time) > -180 && daysUntil(e.start_time) < 400);
@@ -340,21 +464,25 @@
     const players = [...state.data.players].sort((a,b) => a.name.localeCompare(b.name));
     const parts = eventParts(event.id);
     const eventType = event.type || event.manual_type || event.auto_type || 'other';
+    const assignedPlayerIds = new Set((state.data.duties || []).filter(d => String(d.event_id) === String(event.id)).map(d => String(d.player_id)));
     const displayPlayers = eventType === 'duty'
       ? players.filter(player => {
           const p = partFor(event.id, player.id) || {};
-          return ['attending','selected','available'].includes(String(p.holdsport_status_norm || ''));
+          return assignedPlayerIds.has(String(player.id)) || ['attending','selected','available'].includes(String(p.holdsport_status_norm || ''));
         })
       : players;
     const expectedCount = parts.filter(p => isExpectedStatus(p.holdsport_status_norm, eventType)).length;
+    const attendingCount = parts.filter(p => p.holdsport_status_norm === 'attending').length;
     const availableCount = parts.filter(p => p.holdsport_status_norm === 'available').length;
     const selectedCount = parts.filter(p => p.holdsport_status_norm === 'selected').length;
     const vacationCount = parts.filter(p => p.holdsport_status_norm === 'vacation').length;
+    const declinedCount = parts.filter(p => ['declined','unavailable'].includes(String(p.holdsport_status_norm))).length;
     const injuredCount = parts.filter(p => p.holdsport_status_norm === 'injured').length;
     const undecidedCount = eventType === 'duty' ? 0 : parts.filter(p => isRsvpIssue(p.holdsport_status_norm)).length;
     const actualPresent = parts.filter(p => p.actual_attendance === 'present').length;
-    const capacity = Number(event.max_attendees || (eventType === 'duty' ? 2 : 0));
-    const dutySignedUp = parts.filter(p => ['attending','selected'].includes(String(p.holdsport_status_norm))).length;
+    const dutyCapacity = eventType === 'duty' ? eventDutyCapacity(event) : 0;
+    const dutySignedUp = displayPlayers.length;
+    const matchLimit = Number(state.data.configuration?.match_roster_limit || 14);
 
     app.innerHTML = `
       <section class="page-heading"><div><p class="eyebrow">SESSION MODE</p><h1>${esc(typeLabel(event.type || event.manual_type || event.auto_type))}</h1></div><button class="icon-btn" id="manualEventBtn" title="Add manual event">＋</button></section>
@@ -363,22 +491,25 @@
         <div><span class="pill">${esc(typeLabel(event.type || event.manual_type || event.auto_type))}</span><h2>${esc(event.name)}</h2><p>${esc(fmtDate(event.start_time,{weekday:true}))} · ${esc(fmtTime(event.start_time))}${event.place ? ` · ${esc(event.place)}` : ''}</p></div>
         <div class="mini-stats">
           ${eventType === 'duty'
-            ? `<span><b>${dutySignedUp}${capacity ? ` / ${capacity}` : ''}</b> signed up</span>`
-            : `<span><b>${expectedCount}</b> expected</span><span><b>${undecidedCount}</b> undecided</span>`}
-          ${selectedCount ? `<span><b>${selectedCount}</b> selected</span>` : ''}
+            ? `<span><b>${dutySignedUp} / ${dutyCapacity}</b> signed up</span>`
+            : `<span><b>${expectedCount}</b> expected</span><span><b>${undecidedCount}</b> unresolved</span>`}
+          ${eventType === 'match' ? (selectedCount
+            ? `<span><b>${selectedCount} / ${matchLimit}</b> selected</span>`
+            : `<span><b>${attendingCount}</b> YES <small>· roster limit ${matchLimit}</small></span>`) : ''}
           ${availableCount ? `<span><b>${availableCount}</b> available/support</span>` : ''}
           ${injuredCount ? `<span><b>${injuredCount}</b> injured/support</span>` : ''}
+          ${declinedCount ? `<span><b>${declinedCount}</b> no/unavailable</span>` : ''}
           ${vacationCount ? `<span><b>${vacationCount}</b> vacation</span>` : ''}
           <span><b>${actualPresent}</b> marked present</span>
         </div>
-        <div class="button-row"><button class="primary" id="markExpectedBtn">✓ Mark expected present + on time</button>${eventType !== 'duty' ? '<button class="secondary" id="markAllBtn">Mark whole roster</button>' : ''}<button class="ghost" id="eventTypeBtn">Type: ${esc(typeLabel(eventType))}</button></div>
+        <div class="button-row"><button class="primary" id="markExpectedBtn">✓ Mark all expected present</button><button class="ghost" id="eventTypeBtn">Type: ${esc(typeLabel(eventType))}</button></div>
       </section>
 
-      ${eventType === 'duty' && capacity && dutySignedUp < capacity
-        ? `<section class="notice warn"><strong>${capacity - dutySignedUp} secretary slot${capacity - dutySignedUp === 1 ? '' : 's'} still open in Holdsport.</strong> Players who are not signed up are not treated as absent or unreliable.</section>`
+      ${eventType === 'duty' && dutySignedUp < dutyCapacity
+        ? `<section class="notice warn"><strong>${dutyCapacity - dutySignedUp} secretary slot${dutyCapacity - dutySignedUp === 1 ? '' : 's'} still open in Holdsport.</strong> Players who are not signed up are not treated as absent or unreliable.</section>`
         : ''}
       ${eventType === 'duty' && !displayPlayers.length
-        ? `<section class="empty-state card"><strong>No one is signed up yet.</strong><p>This duty needs ${capacity || 2} people. The rest of the roster is not expected to attend this event.</p></section>`
+        ? `<section class="empty-state card"><strong>No one is signed up yet.</strong><p>This duty needs ${dutyCapacity} people. The rest of the roster is not expected to attend this event.</p></section>`
         : `<section class="roster-list">
             ${displayPlayers.map(player => renderRosterRow(event, player)).join('')}
           </section>`}
@@ -387,8 +518,7 @@
 
     $('#eventPicker').addEventListener('change', e => { state.selectedEventId = e.target.value; renderSession(); });
     $('#manualEventBtn').addEventListener('click', openManualEventModal);
-    $('#markExpectedBtn').addEventListener('click', () => bulkPresent(event.id, 'expected'));
-    $('#markAllBtn')?.addEventListener('click', () => bulkPresent(event.id, 'all'));
+    $('#markExpectedBtn').addEventListener('click', () => bulkPresent(event.id));
     $('#eventTypeBtn').addEventListener('click', () => openEventTypeModal(event));
     $$('[data-quick]', app).forEach(btn => btn.addEventListener('click', () => quickAttendance(btn.dataset.player, event.id, btn.dataset.quick)));
     $$('[data-more-player]', app).forEach(btn => btn.addEventListener('click', () => openParticipationModal(event.id, btn.dataset.morePlayer)));
@@ -397,26 +527,32 @@
 
   function renderRosterRow(event, player) {
     const p = partFor(event.id, player.id) || {};
+    const eventType = event.type || event.manual_type || event.auto_type || 'other';
     const holdStatus = p.holdsport_status_norm || 'unknown';
     const actual = p.actual_attendance || '';
     const arrival = num(p.arrival_minutes);
-    let actualLabel = 'Not marked';
-    let actualClass = 'muted';
+    const notExpected = isExplicitlyNotExpected(holdStatus, eventType);
+    let actualLabel = isRsvpIssue(holdStatus) ? 'RSVP unresolved' : 'Not marked';
+    let actualClass = isRsvpIssue(holdStatus) ? 'warn' : 'muted';
+    if (notExpected && !actual) { actualLabel = 'Not expected'; actualClass = 'muted'; }
     if (actual === 'present') { actualLabel = arrival > 0 ? `Present · +${arrival}m` : 'Present · on time'; actualClass = arrival > 0 ? 'warn' : 'ok'; }
     if (actual === 'no_show') { actualLabel = 'No-show'; actualClass = 'alert'; }
     if (actual === 'absent_excused') { actualLabel = 'Excused absence'; actualClass = 'muted'; }
     if (actual === 'absent') { actualLabel = 'Absent'; actualClass = 'warn'; }
 
-    return `<article class="roster-row">
-      <button class="roster-identity" data-more-player="${esc(player.id)}"><span class="avatar">${esc(initials(player.name))}</span><span><strong>${esc(player.name)}</strong><small><span class="status-text ${statusClass(holdStatus)}">Holdsport ${esc(statusLabel(holdStatus))}</span> · <span class="status-text ${actualClass}">${esc(actualLabel)}</span></small></span></button>
-      <div class="quick-grid">
+    const standardActions = `<div class="quick-grid">
         <button data-quick="present" data-player="${esc(player.id)}" class="quick ${actual === 'present' && arrival === 0 ? 'active' : ''}">✓</button>
         <button data-quick="5" data-player="${esc(player.id)}" class="quick ${actual === 'present' && arrival === 5 ? 'active warn' : ''}">+5</button>
         <button data-quick="10" data-player="${esc(player.id)}" class="quick ${actual === 'present' && arrival === 10 ? 'active warn' : ''}">+10</button>
         <button data-quick="15" data-player="${esc(player.id)}" class="quick ${actual === 'present' && arrival === 15 ? 'active warn' : ''}">+15</button>
         <button data-quick="no_show" data-player="${esc(player.id)}" class="quick danger ${actual === 'no_show' ? 'active' : ''}">No show</button>
         <button data-more-player="${esc(player.id)}" class="quick more">•••</button>
-      </div>
+      </div>`;
+    const notExpectedActions = `<div class="not-expected-actions"><span>No action needed</span><button data-quick="present" data-player="${esc(player.id)}" class="small">Present anyway</button><button data-more-player="${esc(player.id)}" class="small">•••</button></div>`;
+
+    return `<article class="roster-row ${notExpected && !actual ? 'not-expected' : ''}">
+      <button class="roster-identity" data-more-player="${esc(player.id)}"><span class="avatar">${esc(initials(player.name))}</span><span><strong>${esc(player.name)}</strong><small><span class="status-text ${statusClass(holdStatus)}">Holdsport ${esc(statusLabel(holdStatus))}</span> · <span class="status-text ${actualClass}">${esc(actualLabel)}</span></small></span></button>
+      ${notExpected && !actual ? notExpectedActions : standardActions}
     </article>`;
   }
 
@@ -471,12 +607,8 @@
       toast('Demo: saved locally for this session.');
       return;
     }
-    await runBusy('Saving…', async () => {
-      const result = await window.ksvApi.call('updateParticipation', data);
-      mergeLocalParticipation(result);
-      render();
-      toast('Saved.');
-    });
+    // Optimistic save: update the UI immediately, then batch/debounce the Sheet write.
+    queueParticipationWrites([data]);
   }
 
   function mergeLocalParticipation(update) {
@@ -485,21 +617,30 @@
     Object.assign(p, update);
   }
 
-  async function bulkPresent(eventId, mode) {
-    if (state.demo) {
-      state.data.players.forEach(pl => {
-        const p = partFor(eventId, pl.id);
-        if (mode === 'expected' && p?.holdsport_status_norm !== 'attending') return;
-        if (p?.actual_attendance) return;
-        mergeLocalParticipation({event_id:eventId,player_id:pl.id,actual_attendance:'present',arrival_minutes:0,ready_at_start:true});
-      });
-      renderSession(); toast('Demo roster marked.'); return;
-    }
-    await runBusy('Marking roster…', async () => {
-      const result = await window.ksvApi.call('bulkPresent', { event_id:eventId, mode });
-      await loadData({ silent:true, keepTab:true });
-      toast(`${result.updated} player${result.updated===1?'':'s'} marked present.`);
+  async function bulkPresent(eventId) {
+    const event = eventById(eventId);
+    if (!event) return;
+    const eventType = event.type || event.manual_type || event.auto_type || 'other';
+    const updates = [];
+    state.data.players.forEach(pl => {
+      const p = partFor(eventId, pl.id) || {};
+      if (!isExpectedStatus(p.holdsport_status_norm, eventType)) return;
+      if (p.actual_attendance) return;
+      updates.push({ event_id:eventId, player_id:pl.id, actual_attendance:'present', arrival_minutes:0, ready_at_start:true });
     });
+    if (!updates.length) { toast('All expected players are already marked.'); return; }
+
+    if (state.demo) {
+      updates.forEach(mergeLocalParticipation);
+      renderSession();
+      toast(`${updates.length} player${updates.length===1?'':'s'} marked present.`);
+      return;
+    }
+
+    // Instant local update + one batched backend request instead of N separate requests.
+    queueParticipationWrites(updates, { render:false, flushNow:true });
+    renderSession();
+    toast(`${updates.length} expected player${updates.length===1?'':'s'} marked present.`);
   }
 
   function openParticipationModal(eventId, playerId) {
@@ -579,12 +720,22 @@
   }
 
   async function updateDuty(id, status) {
-    if (state.demo) { const d=state.data.duties.find(x=>x.id===id); if(d)d.status=status; renderSession(); return; }
-    await runBusy('Saving duty…', async () => {
+    const d=state.data.duties.find(x=>x.id===id);
+    if (!d) return;
+    const previous=d.status;
+    d.status=status;
+    renderSession();
+    if (state.demo) return;
+    statusEl.textContent='Saving duty…';
+    try {
       await window.ksvApi.call('updateDuty', { duty_id:id, status });
-      const d=state.data.duties.find(x=>x.id===id); if(d)d.status=status;
-      renderSession(); toast('Duty updated.');
-    });
+      updateSaveIndicator();
+    } catch (err) {
+      d.status=previous;
+      renderSession();
+      updateSaveIndicator();
+      toast(err.message || 'Duty could not be saved.', 'error');
+    }
   }
 
   function openEventTypeModal(event) {
@@ -707,7 +858,8 @@
       <section class="settings-card"><div><strong>Holdsport credentials</strong><small>${c.holdsport_credentials?'Stored server-side':'Not configured in Script Properties'}</small></div><span class="status-pill ${c.holdsport_credentials?'ok':'warn'}">${c.holdsport_credentials?'READY':'SETUP'}</span></section>
       <section class="settings-card"><div><strong>Holdsport team</strong><small>${c.holdsport_team_id?`Team ID ${esc(c.holdsport_team_id)}`:'No team selected'}</small></div><span class="status-pill ${c.holdsport_team_id?'ok':'warn'}">${c.holdsport_team_id?'READY':'SETUP'}</span></section>
       <section class="card"><h2>Data controls</h2><div class="stack"><button class="primary" id="syncBtn" ${state.demo?'disabled':''}>↻ Sync Holdsport now</button><button class="secondary" id="discoverBtn" ${state.demo?'disabled':''}>Discover Holdsport teams</button><button class="secondary" id="manualEventSettings">+ Add manual event</button></div></section>
-      <section class="card"><h2>Privacy & interpretation</h2><p>Use observable facts and broad context categories. The dashboard highlights patterns; it does not calculate a player score or make lineup decisions.</p><p class="subtle">Season start: ${esc(c.season_start||'2026-09-07')}</p></section>
+      <section class="card"><h2>Team rules</h2><p class="subtle">Season start: ${esc(c.season_start||'2026-09-07')}</p><p class="subtle">Match playing-roster limit: ${esc(c.match_roster_limit||14)}</p></section>
+      <section class="card"><h2>Privacy & interpretation</h2><p>Use observable facts and broad context categories. The dashboard highlights patterns; it does not calculate a player score or make lineup decisions.</p></section>
       <section class="card danger-zone"><h2>Session</h2><div class="stack"><button class="secondary" id="signOutBtn">${state.demo?'Exit demo':'Sign out'}</button><button class="ghost" id="changeBackendBtn" ${state.demo?'disabled':''}>Change backend URL</button></div></section>`;
     $('#syncBtn')?.addEventListener('click',syncNow);
     $('#discoverBtn')?.addEventListener('click',discoverTeams);
@@ -717,21 +869,21 @@
   }
 
   async function syncNow(){
-    await runBusy('Syncing Holdsport…',async()=>{const data=await window.ksvApi.call('sync',{});state.data=normalizeData(data);render();toast('Holdsport synced.');});
+    await runBusy('Syncing Holdsport…',async()=>{const data=await window.ksvApi.call('sync',{});state.data=normalizeData(data);applyPendingParticipationToState();render();toast('Holdsport synced.');});
   }
 
   async function discoverTeams(){
     await runBusy('Finding teams…',async()=>{
       const teams=await window.ksvApi.call('discoverTeams',{});
       openModal(`<div class="modal-handle"></div><div class="modal-header"><div><p class="eyebrow">HOLDSPORT</p><h2>Select team</h2></div><button class="icon-btn" data-close-modal="1">×</button></div><div class="stack">${teams.length?teams.map(t=>`<button class="option-btn" data-team="${esc(t.id)}"><strong>${esc(t.name)}</strong><small>ID ${esc(t.id)} · role ${esc(t.role)}</small></button>`).join(''):'<p>No teams returned. Check credentials.</p>'}</div>`,root=>{
-        $$('[data-team]',root).forEach(b=>b.addEventListener('click',async()=>{const id=b.dataset.team;closeModal();await runBusy('Selecting team…',async()=>{await window.ksvApi.call('setTeamId',{team_id:id});const data=await window.ksvApi.call('sync',{});state.data=normalizeData(data);render();toast('Team selected and synced.');});}));
+        $$('[data-team]',root).forEach(b=>b.addEventListener('click',async()=>{const id=b.dataset.team;closeModal();await runBusy('Selecting team…',async()=>{await window.ksvApi.call('setTeamId',{team_id:id});const data=await window.ksvApi.call('sync',{});state.data=normalizeData(data);applyPendingParticipationToState();render();toast('Team selected and synced.');});}));
       });
     });
   }
 
   function switchTab(tab){ state.tab=tab; if(tab!=='players')state.selectedPlayerId=''; updateNav(); render(); window.scrollTo({top:0,behavior:'smooth'}); }
   function updateNav(){ $$('[data-tab]',nav).forEach(b=>b.classList.toggle('active',b.dataset.tab===state.tab)); }
-  function render(){ if(!state.data)return; statusEl.textContent=state.demo?'Demo mode':'Connected'; showNav(true); updateNav(); if(state.tab==='dashboard')renderDashboard(); else if(state.tab==='session')renderSession(); else if(state.tab==='players')renderPlayers(); else renderSettings(); }
+  function render(){ if(!state.data)return; statusEl.textContent=state.demo?'Demo mode':'Connected'; updateSaveIndicator(); showNav(true); updateNav(); if(state.tab==='dashboard')renderDashboard(); else if(state.tab==='session')renderSession(); else if(state.tab==='players')renderPlayers(); else renderSettings(); }
 
   function normalizeData(data){
     data.players=data.players||[];data.events=data.events||[];data.participation=data.participation||[];data.rsvp_history=data.rsvp_history||[];data.observations=data.observations||[];data.followups=data.followups||[];data.duties=data.duties||[];data.duty_types=data.duty_types||[];data.sync_log=data.sync_log||[];
@@ -744,8 +896,10 @@
     const work = async()=>{
       const data=await window.ksvApi.call('bootstrap',{});
       state.data=normalizeData(data);
+      applyPendingParticipationToState();
       if(!options.keepTab)state.tab=state.tab||'dashboard';
       render();
+      if(Object.keys(state.pendingParticipation||{}).length) scheduleParticipationFlush(120);
       return data;
     };
     if(state.busy) return work();
@@ -768,6 +922,7 @@
 
   async function boot(){
     state.demo=false;state.data=null;
+    state.pendingParticipation=loadPendingParticipation();
     if(!window.ksvApi.getBackendUrl()){renderSetup();return;}
     if(!window.ksvApi.getToken()){renderLogin();return;}
     await loadData();
@@ -800,8 +955,9 @@
   }
 
   nav.addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b)switchTab(b.dataset.tab);});
-  window.addEventListener('online',()=>toast('Back online.'));
-  window.addEventListener('offline',()=>toast('Offline. Existing data is still visible; new writes need a connection.','warn'));
+  window.addEventListener('online',()=>{toast('Back online. Pending changes will sync.');flushPendingParticipation();});
+  window.addEventListener('offline',()=>{updateSaveIndicator();toast('Offline. Attendance changes will be kept locally and synced later.','warn');});
+  document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')flushPendingParticipation();});
 
   if('serviceWorker' in navigator){window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));}
   boot();

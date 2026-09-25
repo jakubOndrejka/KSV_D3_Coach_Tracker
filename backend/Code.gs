@@ -11,12 +11,13 @@
  */
 
 const KSV = {
-  VERSION: '1.0.4',
+  VERSION: '1.0.5',
   DEFAULT_SEASON_START: '2026-09-07',
   SESSION_HOURS: 12,
   DEFAULT_LOOKBACK_DAYS: 21,
   DEFAULT_LOOKAHEAD_DAYS: 60,
   DEFAULT_TIMEZONE: 'Europe/Copenhagen',
+  DEFAULT_MATCH_ROSTER_LIMIT: 14,
   SHEETS: {
     Players: [
       'id', 'holdsport_user_id', 'name', 'role', 'role_name', 'position',
@@ -32,11 +33,11 @@ const KSV = {
       'id', 'event_id', 'player_id', 'holdsport_status', 'holdsport_status_norm',
       'holdsport_updated_at', 'actual_attendance', 'arrival_minutes',
       'ready_at_start', 'context_category', 'contacted_coach',
-      'expected_answer_date', 'manual_note', 'updated_at'
+      'expected_answer_date', 'manual_note', 'updated_at', 'holdsport_status_code'
     ],
     RsvpHistory: [
       'id', 'event_id', 'player_id', 'status', 'status_norm',
-      'changed_at', 'observed_at', 'source'
+      'changed_at', 'observed_at', 'source', 'status_code'
     ],
     Observations: [
       'id', 'player_id', 'event_id', 'created_at', 'category', 'behavior',
@@ -70,6 +71,9 @@ function initializeProject() {
   props.setProperty('SPREADSHEET_ID', ss.getId());
   if (!props.getProperty('SESSION_SECRET')) {
     props.setProperty('SESSION_SECRET', Utilities.getUuid() + Utilities.getUuid() + Utilities.getUuid());
+  }
+  if (!props.getProperty('MATCH_ROSTER_LIMIT')) {
+    props.setProperty('MATCH_ROSTER_LIMIT', String(KSV.DEFAULT_MATCH_ROSTER_LIMIT));
   }
 
   Object.keys(KSV.SHEETS).forEach(name => ensureSheet_(ss, name, KSV.SHEETS[name]));
@@ -152,6 +156,7 @@ function dispatchAuthenticated_(action, data) {
     case 'setTeamId': return setTeamId_(data);
     case 'bulkPresent': return bulkPresent_(data);
     case 'updateParticipation': return updateParticipation_(data);
+    case 'batchUpdateParticipation': return batchUpdateParticipation_(data);
     case 'addObservation': return addObservation_(data);
     case 'resolveObservation': return resolveObservation_(data);
     case 'addFollowup': return addFollowup_(data);
@@ -187,7 +192,8 @@ function configurationState_() {
     app_password: !!props.getProperty('APP_PASSWORD'),
     holdsport_credentials: !!(props.getProperty('HOLDSPORT_USERNAME') && props.getProperty('HOLDSPORT_PASSWORD')),
     holdsport_team_id: props.getProperty('HOLDSPORT_TEAM_ID') || '',
-    season_start: props.getProperty('SEASON_START') || KSV.DEFAULT_SEASON_START
+    season_start: props.getProperty('SEASON_START') || KSV.DEFAULT_SEASON_START,
+    match_roster_limit: numberProperty_('MATCH_ROSTER_LIMIT', KSV.DEFAULT_MATCH_ROSTER_LIMIT)
   };
 }
 
@@ -298,23 +304,12 @@ function syncHoldsport_() {
       ? Utilities.formatDate(seasonStartDate, tz, 'yyyy-MM-dd')
       : KSV.DEFAULT_SEASON_START;
 
-    // The Holdsport API supports `date=...` (from this day onward). Do not apply
-    // another rolling filter after retrieval; we want the full season history.
-    let activities = [];
-    let activitySchema = '';
-    for (let page = 1; page <= 20; page++) {
-      const rawActivities = holdsportFetch_(
-        '/v1/teams/' + encodeURIComponent(teamId) + '/activities?date=' + encodeURIComponent(dateParam) + '&page=' + page + '&per_page=50'
-      );
-      const arr = holdsportArray_(rawActivities, ['activities', 'data', 'items', 'results']);
-      if (!arr) {
-        activitySchema = responseKeys_(rawActivities);
-        break;
-      }
-      if (arr.length === 0) break;
-      activities = activities.concat(arr);
-      if (arr.length < 50) break;
-    }
+    // Fetch the full season robustly. Do not assume that the API will return exactly
+    // the requested page size; some APIs cap page size silently. Continue until an
+    // empty page or a page with no new activity IDs is returned.
+    const activityFetch = fetchAllHoldsportActivities_(teamId, dateParam, 50, 40);
+    const activities = activityFetch.activities;
+    const activitySchema = activityFetch.schema;
 
     // Keep activities even if a date is malformed. We normalize known Holdsport date formats
     // for the browser, but never silently drop an activity solely because a date parser failed.
@@ -404,15 +399,18 @@ function syncHoldsport_() {
         let newStatusRaw = null;
         let newStatusNorm = null;
         let newStatusUpdatedAt = '';
+        let newStatusCode = '';
 
         if (explicit) {
           newStatusRaw = holdsportActivityUserStatus_(explicit, holdsportRegistrationTypeText_(activity));
           newStatusNorm = normalizeHoldsportStatus_(newStatusRaw);
           newStatusUpdatedAt = String(firstDefined_(explicit.updated_at, explicit.changed_at, explicit.modified_at, ''));
+          newStatusCode = String(firstDefined_(explicit.status_code, explicit.rsvp_status_code, explicit.code, ''));
         } else if (undecided) {
           newStatusRaw = String(firstDefined_(undecided.status, undecided.rsvp_status, 'no_rsvp'));
           newStatusNorm = normalizeHoldsportStatus_(newStatusRaw || 'no_rsvp');
           if (newStatusNorm === 'unknown') newStatusNorm = 'undecided';
+          newStatusCode = String(firstDefined_(undecided.status_code, undecided.rsvp_status_code, undecided.code, ''));
         } else if (!old.holdsport_status) {
           newStatusRaw = 'not_seen';
           newStatusNorm = Number(player.role) === 4 ? 'injured' : 'unknown';
@@ -422,9 +420,11 @@ function syncHoldsport_() {
           row.holdsport_status = newStatusRaw;
           row.holdsport_status_norm = newStatusNorm;
           row.holdsport_updated_at = newStatusUpdatedAt;
+          row.holdsport_status_code = newStatusCode;
 
           const changed = String(old.holdsport_status || '') !== String(newStatusRaw) ||
-            String(old.holdsport_updated_at || '') !== String(newStatusUpdatedAt || '');
+            String(old.holdsport_updated_at || '') !== String(newStatusUpdatedAt || '') ||
+            String(old.holdsport_status_code || '') !== String(newStatusCode || '');
           if (changed) {
             historyRows.push({
               id: 'rsvp_' + Utilities.getUuid(),
@@ -434,7 +434,8 @@ function syncHoldsport_() {
               status_norm: newStatusNorm,
               changed_at: newStatusUpdatedAt || nowIso_(),
               observed_at: nowIso_(),
-              source: 'holdsport'
+              source: 'holdsport',
+              status_code: newStatusCode
             });
           }
         }
@@ -488,7 +489,7 @@ function syncHoldsport_() {
     if (dutyRows.length) upsertMany_('Duties', dutyRows);
     if (dutyTypeRows.length) upsertMany_('DutyTypes', dutyTypeRows);
 
-    let message = 'Synced ' + playerRows.length + ' members and ' + eventRows.length + ' activities from ' + dateParam + '.';
+    let message = 'Synced ' + playerRows.length + ' members and ' + eventRows.length + ' activities from ' + dateParam + ' across ' + activityFetch.pages_fetched + ' page(s).';
     if (unparseableActivities) message += ' ' + unparseableActivities + ' activity date(s) could not be normalized and were kept with their raw value.';
     if (!eventRows.length && activitySchema) message += ' Activities response keys: ' + activitySchema + '.';
     if (!eventRows.length) message += ' Holdsport returned no usable activities from ' + dateParam + ' onward.';
@@ -519,15 +520,27 @@ function debugHoldsportSchema() {
   const dateParam = seasonStartDate ? Utilities.formatDate(seasonStartDate, tz, 'yyyy-MM-dd') : KSV.DEFAULT_SEASON_START;
   const rawActivities = holdsportFetch_('/v1/teams/' + encodeURIComponent(teamId) + '/activities?date=' + encodeURIComponent(dateParam) + '&page=1&per_page=5');
   const activities = holdsportArray_(rawActivities, ['activities', 'data', 'items', 'results']) || [];
+  const fullFetch = fetchAllHoldsportActivities_(teamId, dateParam, 50, 40);
+  const dateValues = fullFetch.activities.map(a => parseHoldsportDate_(holdsportActivityStart_(a))).filter(Boolean).sort((a,b) => a.getTime() - b.getTime());
   const diagnostic = {
     version: KSV.VERSION,
     sync_from_date: dateParam,
+    match_roster_limit: numberProperty_('MATCH_ROSTER_LIMIT', KSV.DEFAULT_MATCH_ROSTER_LIMIT),
     member_count: members.length,
     member_top_level: responseKeys_(rawMembers),
     first_member_keys: members.length ? Object.keys(members[0]).sort() : [],
     first_member_nested_user_keys: members.length && members[0].user && typeof members[0].user === 'object' ? Object.keys(members[0].user).sort() : [],
     activity_count_first_page: activities.length,
     activity_top_level: responseKeys_(rawActivities),
+    activity_pagination: {
+      pages_fetched: fullFetch.pages_fetched,
+      total_unique_activities: fullFetch.activities.length,
+      last_page_size: fullFetch.last_page_size,
+      stopped_on_duplicate_page: fullFetch.stopped_on_duplicate_page,
+      first_activity_date: dateValues.length ? dateValues[0].toISOString() : '',
+      last_activity_date: dateValues.length ? dateValues[dateValues.length - 1].toISOString() : '',
+      response_schema_if_unexpected: fullFetch.schema || ''
+    },
     first_activity_keys: activities.length ? Object.keys(activities[0]).sort() : [],
     activity_start_samples: activities.slice(0, 5).map(a => ({
       raw_type: typeof holdsportActivityStart_(a),
@@ -544,6 +557,8 @@ function debugHoldsportSchema() {
     })),
     activity_user_status_samples: diagnosticActivityStatuses_(activities),
     fetched_activity_user_status_samples: diagnosticFetchedActivityStatuses_(activities),
+    no_rsvp_samples: diagnosticNoRsvp_(activities),
+    activity_task_samples: diagnosticActivityTasks_(activities),
     first_member_club_fields_shape: members.length ? describeShape_(members[0].club_fields, 0) : null,
     first_member_position_guess: members.length ? extractHoldsportPosition_(members[0]) : ''
   };
@@ -608,6 +623,45 @@ function updateParticipation_(data) {
   });
   upsertMany_('Participation', [update]);
   return update;
+}
+
+function batchUpdateParticipation_(data) {
+  const updates = Array.isArray(data && data.updates) ? data.updates : [];
+  if (!updates.length) return { updated: 0, rows: [] };
+  if (updates.length > 120) throw new Error('Too many participation updates in one request.');
+
+  const events = indexBy_(readObjects_('Events'), 'id');
+  const players = indexBy_(readObjects_('Players'), 'id');
+  const existingRows = readObjects_('Participation');
+  const byPair = {};
+  existingRows.forEach(r => { byPair[String(r.event_id) + '|' + String(r.player_id)] = r; });
+
+  const allowed = [
+    'actual_attendance', 'arrival_minutes', 'ready_at_start', 'context_category',
+    'contacted_coach', 'expected_answer_date', 'manual_note'
+  ];
+  const rows = [];
+
+  updates.forEach(item => {
+    const eventId = requireId_(item.event_id, 'event_id');
+    const playerId = requireId_(item.player_id, 'player_id');
+    const event = events[eventId];
+    const player = players[playerId];
+    if (!event || !player) throw new Error('Event or player not found for a queued attendance update.');
+
+    const old = byPair[eventId + '|' + playerId] || {};
+    const id = old.id || (event.source === 'holdsport'
+      ? 'part_' + String(event.holdsport_activity_id) + '_' + String(player.holdsport_user_id)
+      : 'part_' + eventId + '_' + playerId);
+    const row = { id: id, event_id: eventId, player_id: playerId, updated_at: nowIso_() };
+    allowed.forEach(k => {
+      if (Object.prototype.hasOwnProperty.call(item, k)) row[k] = sanitizeCell_(item[k]);
+    });
+    rows.push(row);
+  });
+
+  upsertMany_('Participation', rows);
+  return { updated: rows.length, rows: rows };
 }
 
 function addObservation_(data) {
@@ -864,6 +918,61 @@ function holdsportActivityUserId_(u) {
   return String(firstDefined_(u.user_id, u.member_id, u.profile_id, u.user && u.user.id, u.profile && u.profile.id, ''));
 }
 
+function fetchAllHoldsportActivities_(teamId, dateParam, perPage, maxPages) {
+  const pageSize = Number(perPage) || 50;
+  const limit = Number(maxPages) || 40;
+  const activities = [];
+  const seen = {};
+  let pagesFetched = 0;
+  let schema = '';
+  let stoppedOnDuplicatePage = false;
+  let lastPageSize = 0;
+
+  for (let page = 1; page <= limit; page++) {
+    const raw = holdsportFetch_(
+      '/v1/teams/' + encodeURIComponent(teamId) + '/activities?date=' + encodeURIComponent(dateParam) +
+      '&page=' + page + '&per_page=' + pageSize
+    );
+    const arr = holdsportArray_(raw, ['activities', 'data', 'items', 'results']);
+    if (!arr) {
+      schema = responseKeys_(raw);
+      break;
+    }
+    lastPageSize = arr.length;
+    if (!arr.length) break;
+    pagesFetched++;
+
+    let newOnPage = 0;
+    arr.forEach((a, index) => {
+      const id = holdsportActivityId_(a);
+      const fallback = [
+        String(firstDefined_(a && a.name, a && a.title, '')),
+        String(holdsportActivityStart_(a) || ''),
+        String(index)
+      ].join('|');
+      const key = id ? 'id:' + id : 'fallback:' + fallback;
+      if (seen[key]) return;
+      seen[key] = true;
+      activities.push(a);
+      newOnPage++;
+    });
+
+    // If the API ignores page= and returns the same page repeatedly, stop safely.
+    if (newOnPage === 0) {
+      stoppedOnDuplicatePage = true;
+      break;
+    }
+  }
+
+  return {
+    activities: activities,
+    pages_fetched: pagesFetched,
+    last_page_size: lastPageSize,
+    stopped_on_duplicate_page: stoppedOnDuplicatePage,
+    schema: schema
+  };
+}
+
 function holdsportFetch_(path) {
   const props = PropertiesService.getScriptProperties();
   const username = props.getProperty('HOLDSPORT_USERNAME');
@@ -994,24 +1103,26 @@ function diagnosticActivityStatuses_(activities) {
     const users = holdsportArray_(activity.activities_users, ['activities_users', 'users', 'data', 'items']) || [];
     users.forEach(u => {
       const raw = holdsportActivityUserStatus_(u, holdsportRegistrationTypeText_(activity));
-      const key = String(raw);
+      const code = String(firstDefined_(u.status_code, u.rsvp_status_code, u.code, ''));
+      const key = String(raw) + '|' + code;
       if (seen[key]) return;
       seen[key] = true;
       out.push({
-        raw_status: key.slice(0, 80),
-        normalized: normalizeHoldsportStatus_(key),
+        raw_status: String(raw).slice(0, 80),
+        status_code: code.slice(0, 80),
+        normalized: normalizeHoldsportStatus_(raw),
+        registration_type: holdsportRegistrationTypeText_(activity),
         keys: Object.keys(u || {}).sort()
       });
     });
   });
-  return out.slice(0, 20);
+  return out.slice(0, 30);
 }
-
 
 function diagnosticFetchedActivityStatuses_(activities) {
   const out = [];
   const seen = {};
-  (activities || []).slice(0, 3).forEach(activity => {
+  (activities || []).slice(0, 5).forEach(activity => {
     const activityId = holdsportActivityId_(activity);
     if (!activityId) return;
     try {
@@ -1019,19 +1130,86 @@ function diagnosticFetchedActivityStatuses_(activities) {
       const users = holdsportArray_(raw, ['activities_users', 'users', 'data', 'items']) || [];
       users.forEach(u => {
         const rawStatus = holdsportActivityUserStatus_(u, holdsportRegistrationTypeText_(activity));
-        const key = String(rawStatus);
+        const code = String(firstDefined_(u.status_code, u.rsvp_status_code, u.code, ''));
+        const key = String(rawStatus) + '|' + code;
         if (seen[key]) return;
         seen[key] = true;
         out.push({
-          raw_status: key.slice(0, 80),
-          normalized: normalizeHoldsportStatus_(key),
+          raw_status: String(rawStatus).slice(0, 80),
+          status_code: code.slice(0, 80),
+          normalized: normalizeHoldsportStatus_(rawStatus),
+          registration_type: holdsportRegistrationTypeText_(activity),
           keys: Object.keys(u || {}).sort()
         });
       });
-    } catch (ignored) {}
+    } catch (err) {
+      out.push({ endpoint_error: String(err && err.message ? err.message : err).slice(0, 180) });
+    }
   });
-  return out.slice(0, 20);
+  return out.slice(0, 30);
 }
+
+function diagnosticNoRsvp_(activities) {
+  const out = [];
+  (activities || []).slice(0, 5).forEach(activity => {
+    const noRsvp = holdsportArray_(firstDefined_(activity.no_rsvp, activity.no_response, activity.no_responses, []), ['no_rsvp', 'users', 'data', 'items']) || [];
+    const pairs = [];
+    const seen = {};
+    noRsvp.forEach(u => {
+      const status = String(firstDefined_(u && u.status, u && u.rsvp_status, 'no_rsvp'));
+      const code = String(firstDefined_(u && u.status_code, u && u.rsvp_status_code, u && u.code, ''));
+      const key = status + '|' + code;
+      if (seen[key]) return;
+      seen[key] = true;
+      pairs.push({
+        raw_status: status.slice(0, 80),
+        status_code: code.slice(0, 80),
+        normalized: normalizeHoldsportStatus_(status),
+        keys: Object.keys(u || {}).sort()
+      });
+    });
+    out.push({
+      activity_event_type: holdsportEventTypeText_(activity),
+      registration_type: holdsportRegistrationTypeText_(activity),
+      no_rsvp_count: noRsvp.length,
+      unique_status_pairs: pairs.slice(0, 10)
+    });
+  });
+  return out;
+}
+
+function diagnosticActivityTasks_(activities) {
+  const out = [];
+  (activities || []).slice(0, 5).forEach(activity => {
+    const activityId = holdsportActivityId_(activity);
+    if (!activityId) return;
+    try {
+      const raw = holdsportFetch_('/v1/activities/' + encodeURIComponent(activityId) + '/activity_tasks');
+      const tasks = holdsportArray_(raw, ['activity_tasks', 'tasks', 'data', 'items']) || [];
+      out.push({
+        activity_event_type: holdsportEventTypeText_(activity),
+        task_count: tasks.length,
+        tasks: tasks.slice(0, 10).map(task => {
+          const assignments = holdsportArray_(firstDefined_(task.activity_tasks, task.assignments, task.users, []), ['activity_tasks', 'assignments', 'users', 'data', 'items']) || [];
+          return {
+            task_name: String(firstDefined_(task.name, task.title, 'Duty')).slice(0, 100),
+            max_participants: numericOrBlank_(firstDefined_(task.max_participants, task.max_attendees, task.capacity, '')),
+            assigned_count: assignments.length,
+            task_keys: Object.keys(task || {}).sort(),
+            assignment_keys: assignments.length ? Object.keys(assignments[0] || {}).sort() : []
+          };
+        })
+      });
+    } catch (err) {
+      out.push({
+        activity_event_type: holdsportEventTypeText_(activity),
+        endpoint_error: String(err && err.message ? err.message : err).slice(0, 180)
+      });
+    }
+  });
+  return out;
+}
+
 
 function roleName_(role) {
   const map = { 1: 'player', 2: 'coach', 3: 'assistant coach', 4: 'injured', 5: 'inactive', 6: 'team leader' };

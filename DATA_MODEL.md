@@ -53,3 +53,10 @@ Attendance, communication, duties and culture behaviours are different construct
 
 ### `DutyTypes`
 One row per Holdsport task definition on an event. Stores the task name, Holdsport task ID, `max_participants`, whether sign-up is enabled, and the current assigned count. This is separate from `Duties`, which contains only actual player assignments. A two-person secretary task therefore creates one duty definition plus zero, one, or two player assignments; the other roster members are not treated as missing the duty.
+
+
+## v1.0.5 additions
+
+`Participation.holdsport_status_code` preserves Holdsport's numeric/string status code alongside the human-readable status so modern RSVP distinctions can be diagnosed without guessing. `RsvpHistory.status_code` preserves the same value over time.
+
+The frontend also keeps a short-lived browser-side pending attendance queue. This is not a second database: it exists only to make session taps immediate and to retry unsaved changes if Apps Script/Google Sheets is slow or the connection drops.

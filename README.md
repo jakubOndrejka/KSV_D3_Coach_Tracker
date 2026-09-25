@@ -1,6 +1,6 @@
 # KSV D3 Coach Reliability & Culture Tracker
 
-Generated: 2026-09-25
+Generated: 2026-09-26
 
 A mobile-first, no-build GitHub Pages app for tracking the **exceptions and patterns** that matter to the KSV D3 team culture: RSVP reliability, attendance, lateness, readiness, communication, duties, observable culture behaviours, follow-up and repair.
 
@@ -27,6 +27,18 @@ The app intentionally does **not** calculate a universal player score or automat
 - Match RSVP flags around the one-week decision point.
 - Coach-only app password; Holdsport credentials never enter the GitHub repository.
 
+
+
+## v1.0.5 speed + session semantics
+
+- Session attendance taps are now **optimistic**: the UI changes immediately instead of waiting for Google Sheets.
+- Attendance edits are debounced and sent to Apps Script in **batches**, with a local retry queue if the network/backend is slow or temporarily unavailable.
+- Removed **Mark whole roster**. The main button is now **Mark all expected present**.
+- `NO`, `VACATION`, and `UNAVAILABLE` show as **Not expected** and need no attendance click; they can still be marked **Present anyway** if someone unexpectedly comes.
+- Match support semantics remain: `AVAILABLE` and `INJURED` count as expected at the venue for matches, while staying separate from the playing roster.
+- Adds a configurable match roster limit (`MATCH_ROSTER_LIMIT`, default `14`).
+- Full-season Holdsport pagination no longer assumes the server honours the requested page size.
+- Debug output now includes `status + status_code`, `no_rsvp`, pagination totals, and activity-task capacity/assignment shapes.
 
 ## v1.0.4 transport fix
 
