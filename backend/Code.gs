@@ -11,7 +11,7 @@
  */
 
 const KSV = {
-  VERSION: '1.0.5',
+  VERSION: '1.0.6',
   DEFAULT_SEASON_START: '2026-09-07',
   SESSION_HOURS: 12,
   DEFAULT_LOOKBACK_DAYS: 21,
@@ -402,10 +402,26 @@ function syncHoldsport_() {
         let newStatusCode = '';
 
         if (explicit) {
-          newStatusRaw = holdsportActivityUserStatus_(explicit, holdsportRegistrationTypeText_(activity));
+          const registrationType = holdsportRegistrationTypeText_(activity);
+          newStatusRaw = holdsportActivityUserStatus_(explicit, registrationType);
           newStatusNorm = normalizeHoldsportStatus_(newStatusRaw);
           newStatusUpdatedAt = String(firstDefined_(explicit.updated_at, explicit.changed_at, explicit.modified_at, ''));
           newStatusCode = String(firstDefined_(explicit.status_code, explicit.rsvp_status_code, explicit.code, ''));
+
+          // Live KSV Holdsport data uses registration_type=2 for the "Til rådighed"
+          // match workflow. In that mode the REST payload distinguishes:
+          //   status_code 1 / Attending -> coach-selected playing roster
+          //   status_code 5 / Unknown   -> player is available but not selected
+          // Players who truly have not answered are separately present in no_rsvp.
+          // This mapping is therefore more precise than treating every "Unknown" as undecided.
+          const activityType = classifyEventType_(
+            String(firstDefined_(activity.name, activity.title, activity.activity_name, '')),
+            holdsportEventTypeText_(activity)
+          );
+          if (activityType === 'match' && String(registrationType) === '2') {
+            if (newStatusCode === '1' && newStatusNorm === 'attending') newStatusNorm = 'selected';
+            if (newStatusCode === '5' && ['undecided','unknown'].includes(newStatusNorm)) newStatusNorm = 'available';
+          }
         } else if (undecided) {
           newStatusRaw = String(firstDefined_(undecided.status, undecided.rsvp_status, 'no_rsvp'));
           newStatusNorm = normalizeHoldsportStatus_(newStatusRaw || 'no_rsvp');
@@ -581,7 +597,8 @@ function bulkPresent_(data) {
       : 'part_' + eventId + '_' + player.id;
     const old = existing[id] || {};
     const expected = isExpectedAttendanceStatus_(old.holdsport_status_norm, event.manual_type || event.auto_type || 'other');
-    if (mode === 'expected' && !expected) return;
+    const manualNotExpected = ['vacation','unavailable'].includes(String(old.context_category || '').toLowerCase());
+    if (mode === 'expected' && (!expected || manualNotExpected)) return;
     if (old.actual_attendance) return;
     rows.push({
       id: id,

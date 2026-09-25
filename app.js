@@ -16,6 +16,7 @@
     selectedEventId: '',
     selectedPlayerId: '',
     playerWindow: 30,
+    attendanceWindow: 9999,
     demo: false,
     busy: false,
     pendingParticipation: {},
@@ -257,6 +258,10 @@
     return false;
   }
 
+  function hasManualNotExpectedContext(p) {
+    return ['vacation','unavailable'].includes(String(p?.context_category || '').toLowerCase());
+  }
+
   function isRelevantParticipation(p, event) {
     if (!event) return false;
     const type = event.type || event.manual_type || event.auto_type || 'other';
@@ -325,6 +330,105 @@
       openObs: openObs.length,
       undecided: currentUndecided.length
     };
+  }
+
+
+  function eventTypeOf(event) {
+    return event?.type || event?.manual_type || event?.auto_type || 'other';
+  }
+
+  function attendanceBreakdownForPlayer(playerId, days = 5000) {
+    const eventMap = new Map((state.data?.events || []).map(e => [String(e.id), e]));
+    const makeBucket = () => ({ present:0, marked:0, total:0, unmarked:0, late:0, noShows:0, excused:0, absent:0 });
+    const out = { practice:makeBucket(), match:makeBucket(), meeting:makeBucket(), other:makeBucket(), series:[] };
+    const cutoffDays = Number(days) || 5000;
+
+    playerParts(playerId).forEach(p => {
+      const event = eventMap.get(String(p.event_id));
+      if (!event) return;
+      const d = toDate(event.start_time);
+      if (!d || d.getTime() > Date.now()) return;
+      if (cutoffDays !== 9999 && !isWithinPast(event.start_time, cutoffDays)) return;
+      if (!isRelevantParticipation(p, event)) return;
+
+      const type = eventTypeOf(event);
+      const bucketKey = ['practice','match','meeting'].includes(type) ? type : 'other';
+      const b = out[bucketKey];
+      b.total++;
+      const actual = String(p.actual_attendance || '');
+      const marked = ['present','absent_excused','absent','no_show'].includes(actual);
+      if (!marked) b.unmarked++;
+      else {
+        b.marked++;
+        if (actual === 'present') {
+          b.present++;
+          if (num(p.arrival_minutes) > 0) b.late++;
+        }
+        if (actual === 'no_show') b.noShows++;
+        if (actual === 'absent_excused') b.excused++;
+        if (actual === 'absent') b.absent++;
+      }
+      if (['practice','match'].includes(type)) {
+        out.series.push({ event, participation:p, type, marked });
+      }
+    });
+
+    out.series.sort((a,b) => (toDate(a.event.start_time)?.getTime() || 0) - (toDate(b.event.start_time)?.getTime() || 0));
+    return out;
+  }
+
+  function attendanceRate(bucket) {
+    return bucket && bucket.marked ? Math.round((bucket.present / bucket.marked) * 100) : null;
+  }
+
+  function attendanceFraction(bucket, label) {
+    if (!bucket || !bucket.marked) return `— ${label}`;
+    return `${bucket.present}/${bucket.marked} ${label}`;
+  }
+
+  function positionKey(position) {
+    const p = String(position || '').trim().toUpperCase();
+    if (p === 'S' || p.includes('SETTER')) return 'S';
+    if (p === 'OH' || p.includes('OUTSIDE')) return 'OH';
+    if (p === 'MB' || p.includes('MIDDLE')) return 'MB';
+    if (p === 'OPP' || p.includes('OPPOSITE')) return 'OPP';
+    if (p === 'L' || p.includes('LIBERO')) return 'L';
+    return p || 'UNSET';
+  }
+
+  function attendanceBar(bucket, label, compact = false) {
+    const rate = attendanceRate(bucket);
+    const pct = rate === null ? 0 : rate;
+    const fraction = bucket?.marked ? `${bucket.present}/${bucket.marked}` : '—';
+    const missing = bucket?.unmarked || 0;
+    return `<div class="attendance-bar-row ${compact ? 'compact' : ''}">
+      <div class="attendance-bar-meta"><span>${esc(label)}</span><strong>${esc(fraction)}${rate === null ? '' : ` · ${rate}%`}</strong></div>
+      <div class="attendance-track"><span style="width:${pct}%"></span></div>
+      ${missing ? `<small>${missing} past ${label.toLowerCase()} ${missing===1?'is':'are'} still unmarked</small>` : ''}
+    </div>`;
+  }
+
+  function attendanceGraphForPlayer(playerId, days) {
+    const stats = attendanceBreakdownForPlayer(playerId, days);
+    const series = stats.series.slice(-24);
+    const bars = series.map(item => {
+      const p = item.participation;
+      const actual = String(p.actual_attendance || '');
+      let cls = 'unmarked', level = 20, code = '?';
+      if (actual === 'present' && num(p.arrival_minutes) === 0) { cls='good'; level=100; code='P'; }
+      else if (actual === 'present') { cls='warn'; level=78; code='L'; }
+      else if (actual === 'absent_excused') { cls='muted'; level=42; code='E'; }
+      else if (actual === 'absent') { cls='alert'; level=28; code='A'; }
+      else if (actual === 'no_show') { cls='alert'; level=16; code='N'; }
+      const title = `${fmtDate(item.event.start_time)} · ${typeLabel(item.type)} · ${actual || 'unmarked'}${actual==='present'&&num(p.arrival_minutes)>0?` · +${num(p.arrival_minutes)}m`:''}`;
+      return `<div class="attendance-column" title="${esc(title)}"><div class="attendance-column-bar ${cls}" style="height:${level}%"><span>${code}</span></div><small>${esc(fmtDate(item.event.start_time).replace(/\s/g,''))}</small></div>`;
+    }).join('');
+    return `<section class="card attendance-card">
+      <div class="section-title"><div><h2>Attendance at a glance</h2><p>Actual attendance marks only; unmarked history is shown separately.</p></div></div>
+      <div class="attendance-summary-bars">${attendanceBar(stats.practice,'Practice')}${attendanceBar(stats.match,'Match')}</div>
+      <div class="attendance-event-chart">${bars || '<span class="subtle">No practice or match attendance recorded yet.</span>'}</div>
+      <div class="attendance-legend"><span><i class="good"></i>Present</span><span><i class="warn"></i>Late</span><span><i class="muted"></i>Excused</span><span><i class="alert"></i>Absent / no-show</span><span><i class="unmarked"></i>Unmarked</span></div>
+    </section>`;
   }
 
   function severityCell(value, alertAt = 2) {
@@ -531,7 +635,7 @@
     const holdStatus = p.holdsport_status_norm || 'unknown';
     const actual = p.actual_attendance || '';
     const arrival = num(p.arrival_minutes);
-    const notExpected = isExplicitlyNotExpected(holdStatus, eventType);
+    const notExpected = isExplicitlyNotExpected(holdStatus, eventType) || hasManualNotExpectedContext(p);
     let actualLabel = isRsvpIssue(holdStatus) ? 'RSVP unresolved' : 'Not marked';
     let actualClass = isRsvpIssue(holdStatus) ? 'warn' : 'muted';
     if (notExpected && !actual) { actualLabel = 'Not expected'; actualClass = 'muted'; }
@@ -625,6 +729,7 @@
     state.data.players.forEach(pl => {
       const p = partFor(eventId, pl.id) || {};
       if (!isExpectedStatus(p.holdsport_status_norm, eventType)) return;
+      if (hasManualNotExpectedContext(p)) return;
       if (p.actual_attendance) return;
       updates.push({ event_id:eventId, player_id:pl.id, actual_attendance:'present', arrival_minutes:0, ready_at_start:true });
     });
@@ -654,7 +759,7 @@
         <label>Actual attendance<select name="actual_attendance"><option value="">Not marked</option><option value="present">Present</option><option value="absent_excused">Excused absence</option><option value="absent">Absent</option><option value="no_show">No-show</option></select></label>
         <label>Minutes late<input type="number" min="0" max="180" name="arrival_minutes" value="${esc(p.arrival_minutes || 0)}"></label>
         <label class="check-row"><input type="checkbox" name="ready_at_start" ${bool(p.ready_at_start)?'checked':''}> Ready at agreed start</label>
-        <label>Context<select name="context_category"><option value="">—</option><option>excused/personal</option><option>health</option><option>work/study</option><option>emergency</option><option>forgot</option><option>unknown</option></select></label>
+        <label>Context<select name="context_category"><option value="">—</option><option>excused/personal</option><option>health</option><option>work/study</option><option>emergency</option><option>vacation</option><option>unavailable</option><option>forgot</option><option>unknown</option></select></label>
         <label class="check-row"><input type="checkbox" name="contacted_coach" ${bool(p.contacted_coach)?'checked':''}> Contacted coach about uncertainty/change</label>
         <label>Expected answer date<input type="date" name="expected_answer_date" value="${esc(String(p.expected_answer_date || '').slice(0,10))}"></label>
         <label class="span-2">Short factual note<textarea name="manual_note" maxlength="600" placeholder="Observable fact/context, not a personality label.">${esc(p.manual_note || '')}</textarea></label>
@@ -769,11 +874,57 @@
 
   function renderPlayers() {
     if (state.selectedPlayerId && playerById(state.selectedPlayerId)) { renderPlayerDetail(state.selectedPlayerId); return; }
-    app.innerHTML = `<section class="page-heading"><div><p class="eyebrow">ROSTER</p><h1>Players</h1></div></section><section class="player-grid">${[...state.data.players].sort((a,b)=>a.name.localeCompare(b.name)).map(p=>{
+    app.innerHTML = `<section class="page-heading"><div><p class="eyebrow">ROSTER</p><h1>Players</h1><p>Attendance is split by practices and matches.</p></div></section><section class="player-grid">${[...state.data.players].sort((a,b)=>a.name.localeCompare(b.name)).map(p=>{
       const m=metricForPlayer(p.id,60);
-      return `<button class="player-card" data-player-card="${esc(p.id)}"><span class="avatar large">${esc(initials(p.name))}</span><span class="grow"><strong>${esc(p.name)}</strong><small>${esc(p.position||'Position not set')}</small><span class="mini-tags"><i>${m.attended}/${m.opportunities} attended</i>${m.late?`<i class="warn">${m.late} late</i>`:''}${m.openObs?`<i class="alert">${m.openObs} open</i>`:''}</span></span><span>›</span></button>`;
+      const a=attendanceBreakdownForPlayer(p.id,60);
+      return `<button class="player-card" data-player-card="${esc(p.id)}"><span class="avatar large">${esc(initials(p.name))}</span><span class="grow"><strong>${esc(p.name)}</strong><small>${esc(p.position||'Position not set')}</small><span class="mini-tags"><i>${esc(attendanceFraction(a.practice,'practice'))}</i><i>${esc(attendanceFraction(a.match,'match'))}</i>${m.late?`<i class="warn">${m.late} late</i>`:''}${m.openObs?`<i class="alert">${m.openObs} open</i>`:''}</span></span><span>›</span></button>`;
     }).join('')}</section>`;
     $$('[data-player-card]').forEach(b=>b.addEventListener('click',()=>openPlayer(b.dataset.playerCard)));
+  }
+
+  function renderAttendanceCompare() {
+    const days = state.attendanceWindow;
+    const activePlayers = [...(state.data.players || [])].filter(p => p.active === '' || p.active === undefined || bool(p.active));
+    const groupOrder = ['S','OH','MB','OPP','L','UNSET'];
+    const groups = {};
+    activePlayers.forEach(player => {
+      const key = positionKey(player.position);
+      (groups[key] ||= []).push(player);
+    });
+    const extra = Object.keys(groups).filter(k => !groupOrder.includes(k)).sort();
+    const keys = [...groupOrder.filter(k => groups[k]?.length), ...extra];
+    const labelMap = {S:'Setters',OH:'Outside hitters',MB:'Middles',OPP:'Opposites',L:'Liberos',UNSET:'Position not set'};
+    const unassigned = groups.UNSET?.length || 0;
+
+    const sectionHtml = keys.map(key => {
+      const players = [...groups[key]].sort((a,b) => {
+        const aa=attendanceBreakdownForPlayer(a.id, days), bb=attendanceBreakdownForPlayer(b.id, days);
+        const ar=attendanceRate(aa.practice), br=attendanceRate(bb.practice);
+        if ((br ?? -1)!==(ar ?? -1)) return (br ?? -1)-(ar ?? -1);
+        return a.name.localeCompare(b.name);
+      });
+      return `<section class="position-group card">
+        <div class="section-title"><div><p class="eyebrow">${esc(key)}</p><h2>${esc(labelMap[key] || key)}</h2><p>${players.length} player${players.length===1?'':'s'} · sorted by practice attendance</p></div></div>
+        <div class="attendance-compare-list">${players.map(player=>{
+          const a=attendanceBreakdownForPlayer(player.id, days);
+          const pr=attendanceRate(a.practice), mr=attendanceRate(a.match);
+          return `<button class="attendance-player-row" data-compare-player="${esc(player.id)}">
+            <div class="attendance-player-name"><span class="avatar">${esc(initials(player.name))}</span><span><strong>${esc(player.name)}</strong><small>${esc(player.position||'Position not set')}</small></span></div>
+            <div class="compare-metric"><span>Practice <b>${a.practice.marked?`${a.practice.present}/${a.practice.marked}`:'—'}</b></span><div class="mini-progress"><i style="width:${pr??0}%"></i></div><small>${pr===null?'No marks yet':`${pr}%`}${a.practice.unmarked?` · ${a.practice.unmarked} unmarked`:''}</small></div>
+            <div class="compare-metric"><span>Match <b>${a.match.marked?`${a.match.present}/${a.match.marked}`:'—'}</b></span><div class="mini-progress match"><i style="width:${mr??0}%"></i></div><small>${mr===null?'No marks yet':`${mr}%`}${a.match.unmarked?` · ${a.match.unmarked} unmarked`:''}</small></div>
+            <div class="compare-meta"><b>${a.practice.late}</b><small>late</small></div>
+          </button>`;
+        }).join('')}</div>
+      </section>`;
+    }).join('');
+
+    app.innerHTML = `<section class="page-heading"><div><p class="eyebrow">SELECTION CONTEXT</p><h1>Attendance by position</h1><p>Compare players against others competing for similar roles. Attendance is one input, not an automatic lineup decision.</p></div></section>
+      ${unassigned?`<section class="notice warn"><strong>${unassigned} player${unassigned===1?' has':'s have'} no position set.</strong> Open the player and use Edit to set S, OH, MB, OPP or L.</section>`:''}
+      <div class="segmented" id="attendanceWindowTabs"><button data-att-window="30" ${days===30?'class="active"':''}>30 days</button><button data-att-window="60" ${days===60?'class="active"':''}>60 days</button><button data-att-window="9999" ${days===9999?'class="active"':''}>Season</button></div>
+      ${sectionHtml || '<section class="empty-state card"><strong>No players to compare yet.</strong></section>'}`;
+
+    $$('[data-compare-player]').forEach(b=>b.addEventListener('click',()=>openPlayer(b.dataset.comparePlayer)));
+    $$('[data-att-window]').forEach(b=>b.addEventListener('click',()=>{state.attendanceWindow=Number(b.dataset.attWindow);renderAttendanceCompare();}));
   }
 
   function openPlayer(id) { state.selectedPlayerId=id; state.tab='players'; updateNav(); renderPlayerDetail(id); window.scrollTo({top:0,behavior:'smooth'}); }
@@ -781,7 +932,9 @@
   function renderPlayerDetail(playerId) {
     const player=playerById(playerId); if(!player){state.selectedPlayerId='';renderPlayers();return;}
     const days=state.playerWindow;
-    const metrics=metricForPlayer(playerId, days===9999?5000:days);
+    const metricDays=days===9999?5000:days;
+    const metrics=metricForPlayer(playerId, metricDays);
+    const attendance=attendanceBreakdownForPlayer(playerId, days);
     const eventMap=new Map(state.data.events.map(e=>[String(e.id),e]));
     const partTimeline=playerParts(playerId).map(p=>({kind:'participation',date:eventMap.get(String(p.event_id))?.start_time||'',event:eventMap.get(String(p.event_id)),data:p}))
       .filter(x=>isRelevantParticipation(x.data,x.event))
@@ -794,11 +947,13 @@
     app.innerHTML=`
       <section class="page-heading"><button class="icon-btn" id="backPlayers">←</button><div class="grow"><p class="eyebrow">PLAYER</p><h1>${esc(player.name)}</h1><p>${esc(player.position||'Position not set')}</p></div><button class="secondary small" id="editPlayer">Edit</button></section>
       <section class="stats-grid">
-        <div class="stat-card"><b>${metrics.attended}<small> / ${metrics.opportunities}</small></b><span>attendance marks</span></div>
+        <div class="stat-card"><b>${attendance.practice.present}<small> / ${attendance.practice.marked}</small></b><span>practice attendance</span></div>
+        <div class="stat-card"><b>${attendance.match.present}<small> / ${attendance.match.marked}</small></b><span>match attendance</span></div>
         <div class="stat-card"><b>${metrics.late}</b><span>late arrivals</span></div>
         <div class="stat-card"><b>${metrics.noShows}</b><span>no-shows</span></div>
         <div class="stat-card"><b>${metrics.openObs}</b><span>open observations</span></div>
       </section>
+      ${attendanceGraphForPlayer(playerId, days)}
       <section class="card"><div class="section-title"><div><h2>Recent sessions</h2><p>Sequence, not a score.</p></div></div><div class="dot-timeline">${recentDots.length?recentDots.map(x=>dotForParticipation(x.data,x.event)).join(''):'<span class="subtle">No recorded sessions yet.</span>'}</div></section>
       <div class="segmented" id="windowTabs"><button data-window="30" ${days===30?'class="active"':''}>30 days</button><button data-window="60" ${days===60?'class="active"':''}>60 days</button><button data-window="9999" ${days===9999?'class="active"':''}>Season</button></div>
       <section class="section-block"><div class="section-title"><div><h2>Timeline</h2><p>Facts, context, follow-up and repair.</p></div><button class="secondary small" id="addObsPlayer">+ Observation</button></div><div class="timeline">${timeline.length?timeline.map(renderTimelineItem).join(''):'<div class="empty-inline">Nothing recorded in this period.</div>'}</div></section>`;
@@ -846,7 +1001,10 @@
   }
 
   function openPlayerEditModal(player){
-    openModal(`<div class="modal-handle"></div><div class="modal-header"><h2>${esc(player.name)}</h2><button class="icon-btn" data-close-modal="1">×</button></div><form id="playerEdit" class="form-grid"><label class="span-2">Position<input name="position" value="${esc(player.position||'')}" placeholder="OH, MB, S, OPP, L"></label><label class="check-row span-2"><input type="checkbox" name="active" ${bool(player.active)||player.active===''?'checked':''}> Active player</label><button class="primary span-2" type="submit">Save</button></form>`,root=>{
+    const knownPositions=['','S','OH','MB','OPP','L'];
+    const current=String(player.position||'');
+    const options=[...knownPositions,...(!knownPositions.includes(current)&&current?[current]:[])].map(pos=>`<option value="${esc(pos)}" ${pos===current?'selected':''}>${esc(pos||'Position not set')}</option>`).join('');
+    openModal(`<div class="modal-handle"></div><div class="modal-header"><h2>${esc(player.name)}</h2><button class="icon-btn" data-close-modal="1">×</button></div><form id="playerEdit" class="form-grid"><label class="span-2">Position<select name="position">${options}</select></label><p class="subtle span-2">Holdsport is not returning volleyball positions for this team, so positions are stored manually here and preserved during sync.</p><label class="check-row span-2"><input type="checkbox" name="active" ${bool(player.active)||player.active===''?'checked':''}> Active player</label><button class="primary span-2" type="submit">Save</button></form>`,root=>{
       $('#playerEdit',root).addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(e.currentTarget);const payload={player_id:player.id,position:fd.get('position'),active:e.currentTarget.active.checked};closeModal();if(state.demo){Object.assign(player,payload);renderPlayerDetail(player.id);return;}await runBusy('Saving player…',async()=>{const u=await window.ksvApi.call('setPlayerMeta',payload);Object.assign(player,u);renderPlayerDetail(player.id);toast('Player updated.');});});
     });
   }
@@ -881,9 +1039,9 @@
     });
   }
 
-  function switchTab(tab){ state.tab=tab; if(tab!=='players')state.selectedPlayerId=''; updateNav(); render(); window.scrollTo({top:0,behavior:'smooth'}); }
+  function switchTab(tab){ state.tab=tab; if(!['players','attendance'].includes(tab))state.selectedPlayerId=''; updateNav(); render(); window.scrollTo({top:0,behavior:'smooth'}); }
   function updateNav(){ $$('[data-tab]',nav).forEach(b=>b.classList.toggle('active',b.dataset.tab===state.tab)); }
-  function render(){ if(!state.data)return; statusEl.textContent=state.demo?'Demo mode':'Connected'; updateSaveIndicator(); showNav(true); updateNav(); if(state.tab==='dashboard')renderDashboard(); else if(state.tab==='session')renderSession(); else if(state.tab==='players')renderPlayers(); else renderSettings(); }
+  function render(){ if(!state.data)return; statusEl.textContent=state.demo?'Demo mode':'Connected'; updateSaveIndicator(); showNav(true); updateNav(); if(state.tab==='dashboard')renderDashboard(); else if(state.tab==='session')renderSession(); else if(state.tab==='players')renderPlayers(); else if(state.tab==='attendance')renderAttendanceCompare(); else renderSettings(); }
 
   function normalizeData(data){
     data.players=data.players||[];data.events=data.events||[];data.participation=data.participation||[];data.rsvp_history=data.rsvp_history||[];data.observations=data.observations||[];data.followups=data.followups||[];data.duties=data.duties||[];data.duty_types=data.duty_types||[];data.sync_log=data.sync_log||[];

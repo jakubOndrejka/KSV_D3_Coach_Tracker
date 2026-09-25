@@ -60,3 +60,9 @@ One row per Holdsport task definition on an event. Stores the task name, Holdspo
 `Participation.holdsport_status_code` preserves Holdsport's numeric/string status code alongside the human-readable status so modern RSVP distinctions can be diagnosed without guessing. `RsvpHistory.status_code` preserves the same value over time.
 
 The frontend also keeps a short-lived browser-side pending attendance queue. This is not a second database: it exists only to make session taps immediate and to retry unsaved changes if Apps Script/Google Sheets is slow or the connection drops.
+
+## v1.0.6 interpretation
+
+Attendance comparison is derived in the frontend from `Participation.actual_attendance` and `Events.auto_type/manual_type`; no new Sheet is required. Position remains `Players.position` and is coach-entered.
+
+For KSV match activities with Holdsport `registration_type=2`, the backend interprets explicit `activities_users` status code `1` as selected and status code `5` as available/not selected. `no_rsvp` remains undecided.
