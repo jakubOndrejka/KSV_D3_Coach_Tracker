@@ -117,15 +117,40 @@
   }
 
   function typeLabel(type) {
-    return ({ practice:'Practice', match:'Match', meeting:'Meeting', other:'Other' })[type] || 'Other';
+    return ({ practice:'Practice', match:'Match', meeting:'Meeting', duty:'Secretary duty', other:'Other' })[type] || 'Other';
   }
 
   function statusLabel(status) {
-    return ({ attending:'YES', declined:'NO', undecided:'UNDECIDED', unknown:'UNKNOWN' })[status] || String(status || 'UNKNOWN').toUpperCase();
+    return ({
+      attending:'YES', selected:'SELECTED', available:'AVAILABLE',
+      declined:'NO', unavailable:'UNAVAILABLE', vacation:'VACATION',
+      injured:'INJURED / SUPPORT', undecided:'UNDECIDED', unknown:'UNKNOWN'
+    })[status] || String(status || 'UNKNOWN').toUpperCase();
   }
 
   function statusClass(status) {
-    return ({ attending:'ok', declined:'muted', undecided:'warn', unknown:'muted' })[status] || 'muted';
+    return ({
+      attending:'ok', selected:'ok', available:'ok',
+      declined:'muted', unavailable:'muted', vacation:'muted', injured:'muted',
+      undecided:'warn', unknown:'muted'
+    })[status] || 'muted';
+  }
+
+  function isExpectedStatus(status, eventType) {
+    if (['attending','selected'].includes(String(status || ''))) return true;
+    return eventType === 'match' && ['available','injured'].includes(String(status || ''));
+  }
+
+  function isRsvpIssue(status) {
+    return ['undecided','unknown'].includes(String(status || 'unknown'));
+  }
+
+  function isRelevantParticipation(p, event) {
+    if (!event) return false;
+    const type = event.type || event.manual_type || event.auto_type || 'other';
+    if (type !== 'duty') return true;
+    return isExpectedStatus(p?.holdsport_status_norm, type) ||
+      ['present','no_show','absent'].includes(String(p?.actual_attendance || ''));
   }
 
   function playerById(id) { return state.data?.players.find(p => String(p.id) === String(id)); }
@@ -137,6 +162,7 @@
   function eventParts(eventId) { return state.data?.participation.filter(p => String(p.event_id) === String(eventId)) || []; }
   function obsForPlayer(playerId) { return state.data?.observations.filter(o => String(o.player_id) === String(playerId)) || []; }
   function dutiesForPlayer(playerId) { return state.data?.duties.filter(d => String(d.player_id) === String(playerId)) || []; }
+  function dutyTypesForEvent(eventId) { return state.data?.duty_types.filter(d => String(d.event_id) === String(eventId)) || []; }
 
   function sortedEvents() {
     return [...(state.data?.events || [])].sort((a,b) => (toDate(a.start_time)?.getTime() || 0) - (toDate(b.start_time)?.getTime() || 0));
@@ -157,7 +183,7 @@
     const eventMap = new Map((state.data?.events || []).map(e => [String(e.id), e]));
     const relevantParts = playerParts(playerId).filter(p => {
       const e = eventMap.get(String(p.event_id));
-      return e && isWithinPast(e.start_time, days);
+      return e && isWithinPast(e.start_time, days) && isRelevantParticipation(p, e);
     });
     const attended = relevantParts.filter(p => p.actual_attendance === 'present');
     const late = attended.filter(p => num(p.arrival_minutes) > 0);
@@ -173,7 +199,7 @@
       const du = daysUntil(e.start_time);
       if (du < 0 || du > 7) return false;
       const p = partFor(e.id, playerId);
-      return !p || ['undecided','unknown'].includes(String(p.holdsport_status_norm || 'unknown')) && !bool(p.contacted_coach);
+      return !p || (isRsvpIssue(p.holdsport_status_norm) && !bool(p.contacted_coach));
     });
 
     return {
@@ -204,7 +230,7 @@
         state.data.players.forEach(player => {
           const p = partFor(e.id, player.id);
           const status = p?.holdsport_status_norm || 'unknown';
-          if (['undecided','unknown'].includes(status) && !bool(p?.contacted_coach)) {
+          if (isRsvpIssue(status) && !bool(p?.contacted_coach)) {
             items.push({ tone:'warn', title:player.name, text:`${fmtDate(e.start_time)} match: still ${status}.`, eventId:e.id, playerId:player.id });
           }
         });
@@ -313,29 +339,56 @@
 
     const players = [...state.data.players].sort((a,b) => a.name.localeCompare(b.name));
     const parts = eventParts(event.id);
-    const expectedCount = parts.filter(p => p.holdsport_status_norm === 'attending').length;
-    const undecidedCount = parts.filter(p => ['undecided','unknown'].includes(String(p.holdsport_status_norm))).length;
+    const eventType = event.type || event.manual_type || event.auto_type || 'other';
+    const displayPlayers = eventType === 'duty'
+      ? players.filter(player => {
+          const p = partFor(event.id, player.id) || {};
+          return ['attending','selected','available'].includes(String(p.holdsport_status_norm || ''));
+        })
+      : players;
+    const expectedCount = parts.filter(p => isExpectedStatus(p.holdsport_status_norm, eventType)).length;
+    const availableCount = parts.filter(p => p.holdsport_status_norm === 'available').length;
+    const selectedCount = parts.filter(p => p.holdsport_status_norm === 'selected').length;
+    const vacationCount = parts.filter(p => p.holdsport_status_norm === 'vacation').length;
+    const injuredCount = parts.filter(p => p.holdsport_status_norm === 'injured').length;
+    const undecidedCount = eventType === 'duty' ? 0 : parts.filter(p => isRsvpIssue(p.holdsport_status_norm)).length;
     const actualPresent = parts.filter(p => p.actual_attendance === 'present').length;
+    const capacity = Number(event.max_attendees || (eventType === 'duty' ? 2 : 0));
+    const dutySignedUp = parts.filter(p => ['attending','selected'].includes(String(p.holdsport_status_norm))).length;
 
     app.innerHTML = `
       <section class="page-heading"><div><p class="eyebrow">SESSION MODE</p><h1>${esc(typeLabel(event.type || event.manual_type || event.auto_type))}</h1></div><button class="icon-btn" id="manualEventBtn" title="Add manual event">＋</button></section>
       <section class="event-picker-wrap"><select id="eventPicker" class="event-picker">${events.map(e => `<option value="${esc(e.id)}" ${e.id === event.id ? 'selected' : ''}>${esc(fmtDate(e.start_time))} · ${esc(e.name)}</option>`).join('')}</select></section>
       <section class="event-head card">
         <div><span class="pill">${esc(typeLabel(event.type || event.manual_type || event.auto_type))}</span><h2>${esc(event.name)}</h2><p>${esc(fmtDate(event.start_time,{weekday:true}))} · ${esc(fmtTime(event.start_time))}${event.place ? ` · ${esc(event.place)}` : ''}</p></div>
-        <div class="mini-stats"><span><b>${expectedCount}</b> expected</span><span><b>${undecidedCount}</b> undecided</span><span><b>${actualPresent}</b> marked present</span></div>
-        <div class="button-row"><button class="primary" id="markExpectedBtn">✓ Mark expected present + on time</button><button class="secondary" id="markAllBtn">Mark whole roster</button><button class="ghost" id="eventTypeBtn">Type: ${esc(typeLabel(event.type || event.manual_type || event.auto_type))}</button></div>
+        <div class="mini-stats">
+          ${eventType === 'duty'
+            ? `<span><b>${dutySignedUp}${capacity ? ` / ${capacity}` : ''}</b> signed up</span>`
+            : `<span><b>${expectedCount}</b> expected</span><span><b>${undecidedCount}</b> undecided</span>`}
+          ${selectedCount ? `<span><b>${selectedCount}</b> selected</span>` : ''}
+          ${availableCount ? `<span><b>${availableCount}</b> available/support</span>` : ''}
+          ${injuredCount ? `<span><b>${injuredCount}</b> injured/support</span>` : ''}
+          ${vacationCount ? `<span><b>${vacationCount}</b> vacation</span>` : ''}
+          <span><b>${actualPresent}</b> marked present</span>
+        </div>
+        <div class="button-row"><button class="primary" id="markExpectedBtn">✓ Mark expected present + on time</button>${eventType !== 'duty' ? '<button class="secondary" id="markAllBtn">Mark whole roster</button>' : ''}<button class="ghost" id="eventTypeBtn">Type: ${esc(typeLabel(eventType))}</button></div>
       </section>
 
-      <section class="roster-list">
-        ${players.map(player => renderRosterRow(event, player)).join('')}
-      </section>
+      ${eventType === 'duty' && capacity && dutySignedUp < capacity
+        ? `<section class="notice warn"><strong>${capacity - dutySignedUp} secretary slot${capacity - dutySignedUp === 1 ? '' : 's'} still open in Holdsport.</strong> Players who are not signed up are not treated as absent or unreliable.</section>`
+        : ''}
+      ${eventType === 'duty' && !displayPlayers.length
+        ? `<section class="empty-state card"><strong>No one is signed up yet.</strong><p>This duty needs ${capacity || 2} people. The rest of the roster is not expected to attend this event.</p></section>`
+        : `<section class="roster-list">
+            ${displayPlayers.map(player => renderRosterRow(event, player)).join('')}
+          </section>`}
       ${renderDuties(event.id)}
     `;
 
     $('#eventPicker').addEventListener('change', e => { state.selectedEventId = e.target.value; renderSession(); });
     $('#manualEventBtn').addEventListener('click', openManualEventModal);
     $('#markExpectedBtn').addEventListener('click', () => bulkPresent(event.id, 'expected'));
-    $('#markAllBtn').addEventListener('click', () => bulkPresent(event.id, 'all'));
+    $('#markAllBtn')?.addEventListener('click', () => bulkPresent(event.id, 'all'));
     $('#eventTypeBtn').addEventListener('click', () => openEventTypeModal(event));
     $$('[data-quick]', app).forEach(btn => btn.addEventListener('click', () => quickAttendance(btn.dataset.player, event.id, btn.dataset.quick)));
     $$('[data-more-player]', app).forEach(btn => btn.addEventListener('click', () => openParticipationModal(event.id, btn.dataset.morePlayer)));
@@ -368,11 +421,38 @@
   }
 
   function renderDuties(eventId) {
-    const duties = (state.data.duties || []).filter(d => String(d.event_id) === String(eventId));
-    if (!duties.length) return '';
-    return `<section class="section-block"><div class="section-title"><div><h2>Duties</h2><p>Holdsport assignments + manual completion.</p></div></div><div class="duty-list">${duties.map(d => {
-      const p = playerById(d.player_id);
-      return `<div class="duty-row"><span><strong>${esc(d.duty_name)}</strong><small>${esc(p?.name || 'Unknown player')} · ${esc(d.status)}</small></span><span class="button-row tight"><button class="small ${d.status==='done'?'active':''}" data-duty="${esc(d.id)}" data-duty-status="done">Done</button><button class="small ${d.status==='covered'?'active':''}" data-duty="${esc(d.id)}" data-duty-status="covered">Covered</button><button class="small danger ${d.status==='missed'?'active':''}" data-duty="${esc(d.id)}" data-duty-status="missed">Missed</button></span></div>`;
+    const assignments = (state.data.duties || []).filter(d => String(d.event_id) === String(eventId));
+    const types = dutyTypesForEvent(eventId);
+    if (!assignments.length && !types.length) return '';
+
+    const assignmentKey = d => String(d.holdsport_task_id || d.duty_name || '');
+    const knownKeys = new Set(types.map(t => String(t.holdsport_task_id || t.duty_name || '')));
+    const groups = [];
+
+    types.forEach(t => {
+      const key = String(t.holdsport_task_id || t.duty_name || '');
+      groups.push({
+        name: t.duty_name || 'Duty',
+        max: Number(t.max_participants || 0),
+        assigned: assignments.filter(d => assignmentKey(d) === key)
+      });
+    });
+
+    assignments.filter(d => !knownKeys.has(assignmentKey(d))).forEach(d => {
+      let g = groups.find(x => x.name === d.duty_name && !x.max);
+      if (!g) { g = { name:d.duty_name || 'Duty', max:0, assigned:[] }; groups.push(g); }
+      g.assigned.push(d);
+    });
+
+    return `<section class="section-block"><div class="section-title"><div><h2>Duties</h2><p>Only assigned players are accountable. Unfilled slots are shown separately.</p></div></div><div class="duty-list">${groups.map(g => {
+      const count = g.assigned.length;
+      const coverage = g.max ? `${count}/${g.max} signed up` : `${count} assigned`;
+      const vacancy = g.max && count < g.max ? `<small class="status-text warn">${g.max-count} slot${g.max-count===1?'':'s'} still open</small>` : '';
+      const rows = g.assigned.length ? g.assigned.map(d => {
+        const p = playerById(d.player_id);
+        return `<div class="duty-row"><span><strong>${esc(g.name)}</strong><small>${esc(p?.name || 'Unknown player')} · ${esc(d.status)}</small></span><span class="button-row tight"><button class="small ${d.status==='done'?'active':''}" data-duty="${esc(d.id)}" data-duty-status="done">Done</button><button class="small ${d.status==='covered'?'active':''}" data-duty="${esc(d.id)}" data-duty-status="covered">Covered</button><button class="small danger ${d.status==='missed'?'active':''}" data-duty="${esc(d.id)}" data-duty-status="missed">Missed</button></span></div>`;
+      }).join('') : `<div class="duty-row"><span><strong>${esc(g.name)}</strong><small>No one signed up yet.</small></span></div>`;
+      return `<div class="card duty-group"><div class="section-title"><div><h3>${esc(g.name)}</h3><p>${esc(coverage)}</p>${vacancy}</div></div>${rows}</div>`;
     }).join('')}</div></section>`;
   }
 
@@ -508,7 +588,7 @@
   }
 
   function openEventTypeModal(event) {
-    openModal(`<div class="modal-handle"></div><div class="modal-header"><h2>Event type</h2><button class="icon-btn" data-close-modal="1">×</button></div><div class="stack">${['practice','match','meeting','other'].map(t => `<button class="option-btn ${(event.type||event.manual_type||event.auto_type)===t?'selected':''}" data-type="${t}">${typeLabel(t)}</button>`).join('')}</div>`, root => {
+    openModal(`<div class="modal-handle"></div><div class="modal-header"><h2>Event type</h2><button class="icon-btn" data-close-modal="1">×</button></div><div class="stack">${['practice','match','meeting','duty','other'].map(t => `<button class="option-btn ${(event.type||event.manual_type||event.auto_type)===t?'selected':''}" data-type="${t}">${typeLabel(t)}</button>`).join('')}</div>`, root => {
       $$('[data-type]', root).forEach(btn => btn.addEventListener('click', async () => {
         const type=btn.dataset.type; closeModal();
         if (state.demo) { event.manual_type=type; event.type=type; renderSession(); return; }
@@ -521,7 +601,7 @@
     const defaultStart = new Date(Date.now()+3600000);
     openModal(`<div class="modal-handle"></div><div class="modal-header"><div><p class="eyebrow">MANUAL EVENT</p><h2>Add event</h2></div><button class="icon-btn" data-close-modal="1">×</button></div><form id="eventForm" class="form-grid">
       <label class="span-2">Name<input name="name" required placeholder="Team meeting"></label>
-      <label>Type<select name="type"><option value="practice">Practice</option><option value="match">Match</option><option value="meeting" selected>Meeting</option><option value="other">Other</option></select></label>
+      <label>Type<select name="type"><option value="practice">Practice</option><option value="match">Match</option><option value="meeting" selected>Meeting</option><option value="duty">Secretary duty</option><option value="other">Other</option></select></label>
       <label>Start<input type="datetime-local" name="start_time" required value="${esc(isoLocalInput(defaultStart))}"></label>
       <label class="span-2">Place<input name="place" placeholder="Optional"></label>
       <button class="primary span-2" type="submit">Add event</button>
@@ -553,6 +633,7 @@
     const metrics=metricForPlayer(playerId, days===9999?5000:days);
     const eventMap=new Map(state.data.events.map(e=>[String(e.id),e]));
     const partTimeline=playerParts(playerId).map(p=>({kind:'participation',date:eventMap.get(String(p.event_id))?.start_time||'',event:eventMap.get(String(p.event_id)),data:p}))
+      .filter(x=>isRelevantParticipation(x.data,x.event))
       .filter(x=>days===9999||isWithinPast(x.date,days));
     const obsTimeline=obsForPlayer(playerId).map(o=>({kind:'observation',date:o.created_at,data:o})).filter(x=>days===9999||isWithinPast(x.date,days));
     const dutyTimeline=dutiesForPlayer(playerId).map(d=>({kind:'duty',date:eventMap.get(String(d.event_id))?.start_time||'',event:eventMap.get(String(d.event_id)),data:d})).filter(x=>days===9999||isWithinPast(x.date,days));
@@ -626,7 +707,7 @@
       <section class="settings-card"><div><strong>Holdsport credentials</strong><small>${c.holdsport_credentials?'Stored server-side':'Not configured in Script Properties'}</small></div><span class="status-pill ${c.holdsport_credentials?'ok':'warn'}">${c.holdsport_credentials?'READY':'SETUP'}</span></section>
       <section class="settings-card"><div><strong>Holdsport team</strong><small>${c.holdsport_team_id?`Team ID ${esc(c.holdsport_team_id)}`:'No team selected'}</small></div><span class="status-pill ${c.holdsport_team_id?'ok':'warn'}">${c.holdsport_team_id?'READY':'SETUP'}</span></section>
       <section class="card"><h2>Data controls</h2><div class="stack"><button class="primary" id="syncBtn" ${state.demo?'disabled':''}>↻ Sync Holdsport now</button><button class="secondary" id="discoverBtn" ${state.demo?'disabled':''}>Discover Holdsport teams</button><button class="secondary" id="manualEventSettings">+ Add manual event</button></div></section>
-      <section class="card"><h2>Privacy & interpretation</h2><p>Use observable facts and broad context categories. The dashboard highlights patterns; it does not calculate a player score or make lineup decisions.</p><p class="subtle">Season start: ${esc(c.season_start||'2026-08-01')}</p></section>
+      <section class="card"><h2>Privacy & interpretation</h2><p>Use observable facts and broad context categories. The dashboard highlights patterns; it does not calculate a player score or make lineup decisions.</p><p class="subtle">Season start: ${esc(c.season_start||'2026-09-07')}</p></section>
       <section class="card danger-zone"><h2>Session</h2><div class="stack"><button class="secondary" id="signOutBtn">${state.demo?'Exit demo':'Sign out'}</button><button class="ghost" id="changeBackendBtn" ${state.demo?'disabled':''}>Change backend URL</button></div></section>`;
     $('#syncBtn')?.addEventListener('click',syncNow);
     $('#discoverBtn')?.addEventListener('click',discoverTeams);
@@ -653,7 +734,7 @@
   function render(){ if(!state.data)return; statusEl.textContent=state.demo?'Demo mode':'Connected'; showNav(true); updateNav(); if(state.tab==='dashboard')renderDashboard(); else if(state.tab==='session')renderSession(); else if(state.tab==='players')renderPlayers(); else renderSettings(); }
 
   function normalizeData(data){
-    data.players=data.players||[];data.events=data.events||[];data.participation=data.participation||[];data.rsvp_history=data.rsvp_history||[];data.observations=data.observations||[];data.followups=data.followups||[];data.duties=data.duties||[];data.sync_log=data.sync_log||[];
+    data.players=data.players||[];data.events=data.events||[];data.participation=data.participation||[];data.rsvp_history=data.rsvp_history||[];data.observations=data.observations||[];data.followups=data.followups||[];data.duties=data.duties||[];data.duty_types=data.duty_types||[];data.sync_log=data.sync_log||[];
     data.events.forEach(e=>{e.type=e.manual_type||e.type||e.auto_type||'other';});
     return data;
   }
@@ -715,7 +796,7 @@
     }));
     const observations=[{id:'do1',player_id:'dp1',event_id:'de-1',created_at:new Date(base-5*86400000).toISOString(),category:'communication',behavior:'Availability change was not communicated',severity:'concern',positive:false,note:'',status:'open'},{id:'do2',player_id:'dp4',event_id:'de-2',created_at:new Date(base-9*86400000).toISOString(),category:'responsibility',behavior:'Good repair / took responsibility',severity:'info',positive:true,note:'',status:'resolved'}];
     const duties=[{id:'dd1',event_id:'de-2',player_id:'dp2',duty_name:'Table / secretary',status:'done',source:'demo'},{id:'dd2',event_id:'de-1',player_id:'dp5',duty_name:'Ball throwing',status:'missed',source:'demo'}];
-    return normalizeData({generated_at:new Date().toISOString(),configuration:{holdsport_credentials:true,holdsport_team_id:'DEMO',season_start:'2026-08-01'},players,events,participation,rsvp_history:[],observations,followups:[],duties,sync_log:[]});
+    return normalizeData({generated_at:new Date().toISOString(),configuration:{holdsport_credentials:true,holdsport_team_id:'DEMO',season_start:'2026-09-07'},players,events,participation,rsvp_history:[],observations,followups:[],duties,sync_log:[]});
   }
 
   nav.addEventListener('click',e=>{const b=e.target.closest('[data-tab]');if(b)switchTab(b.dataset.tab);});

@@ -82,8 +82,7 @@ Optional properties:
 
 | Property | Default | Purpose |
 |---|---:|---|
-| `SEASON_START` | `2026-08-01` | First date included in the dashboard |
-| `SYNC_LOOKBACK_DAYS` | `21` | How far back each API sync re-checks |
+| `SEASON_START` | `2026-09-07` | First date included in the dashboard |
 | `SYNC_LOOKAHEAD_DAYS` | `60` | How far ahead activities are pulled |
 
 Do **not** add `HOLDSPORT_TEAM_ID` yet; the web app can discover it for you.
@@ -343,7 +342,7 @@ You can keep the same `/exec` URL.
 
 ### "Backend request timed out"
 
-If you previously uploaded **v1.0.0**, replace `api.js`, `sw.js`, and `backend/Code.gs` with the v1.0.3 files, then redeploy Apps Script as a **new version**. v1.0.0 had an iframe bridge bug that could produce this timeout even when the password and deployment were correct.
+If you previously uploaded **v1.0.0**, replace `api.js`, `sw.js`, and `backend/Code.gs` with the v1.0.4 files, then redeploy Apps Script as a **new version**. v1.0.0 had an iframe bridge bug that could produce this timeout even when the password and deployment were correct.
 
 Most likely:
 
@@ -378,3 +377,20 @@ Redeploy the Web App as a **new version** under the existing deployment.
 - Keep notes factual and minimal.
 - Avoid detailed medical, family or other sensitive explanations when a broad context category is sufficient.
 - If you stop using the app, delete or disable the Apps Script Web App deployment and the hourly trigger.
+
+
+## v1.0.4 Holdsport behaviour
+
+- The Holdsport sync starts at `SEASON_START`. For KSV D3 2026/27 use `2026-09-07`.
+- Match RSVP states are kept separately when Holdsport reports them: `YES`, `SELECTED`, `AVAILABLE`, `NO`, `UNAVAILABLE`, `VACATION`, `INJURED`, `UNDECIDED`.
+- `AVAILABLE` is treated as expected support for a match, but remains distinct from the selected playing roster.
+- `INJURED` is also treated as expected support for KSV D3 matches unless the player is explicitly unavailable/away.
+- Secretary/duty activities do not count the whole roster as an attendance opportunity.
+- Holdsport activity tasks are imported with `max_participants`. For example, a secretary task with capacity 2 is shown as `0/2`, `1/2`, or `2/2`; only the people actually assigned to it can later be marked Done/Covered/Missed.
+
+
+### Available / vacation status caveat
+
+Holdsport's current UI supports both **Til rådighed / Available** and the vacation calendar. The documented REST API is less explicit about these newer distinctions. v1.0.4 recognizes them when the live activity payload exposes a textual status, and it also understands `registration_type` plus `joined_status`/`picked` for availability-selection activities.
+
+If a real player who is visibly `Available` or on `Vacation` in Holdsport still appears as `UNKNOWN`, run `debugHoldsportSchema()` and compare the `activity_event_type_samples`, `activity_user_status_samples`, and `fetched_activity_user_status_samples` sections. Do not guess or manually relabel large numbers of players until that live payload has been checked.

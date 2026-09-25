@@ -49,3 +49,7 @@ Basic sync diagnostics.
 ## Why there is no player score
 
 Attendance, communication, duties and culture behaviours are different constructs. The UI shows separate exception counts and timelines rather than collapsing them into one number.
+
+
+### `DutyTypes`
+One row per Holdsport task definition on an event. Stores the task name, Holdsport task ID, `max_participants`, whether sign-up is enabled, and the current assigned count. This is separate from `Duties`, which contains only actual player assignments. A two-person secretary task therefore creates one duty definition plus zero, one, or two player assignments; the other roster members are not treated as missing the duty.

@@ -28,9 +28,9 @@ The app intentionally does **not** calculate a universal player score or automat
 - Coach-only app password; Holdsport credentials never enter the GitHub repository.
 
 
-## v1.0.3 transport fix
+## v1.0.4 transport fix
 
-This package includes a fix for Apps Script HTML Service's nested iframe behavior. The original v1.0.0 bridge could successfully process a login on the backend but never deliver the response back to GitHub Pages, causing a 30-second **Backend request timed out** message. Version 1.0.3 sends the bridge reply to the top page and validates it with a per-request random bridge key.
+This package includes a fix for Apps Script HTML Service's nested iframe behavior. The original v1.0.0 bridge could successfully process a login on the backend but never deliver the response back to GitHub Pages, causing a 30-second **Backend request timed out** message. Version 1.0.4 sends the bridge reply to the top page and validates it with a per-request random bridge key.
 
 ## Fast start
 
@@ -65,3 +65,10 @@ Use a strong app password. Avoid detailed health or personal information in note
 ## Holdsport API caveat
 
 The official Holdsport repository documents Basic Authentication and the endpoints used here, but parts of the example payloads are old. The sync code therefore stores raw statuses, normalizes conservatively, and preserves manual data. After first connection, check 2–3 real practices/matches against Holdsport before relying on automatic flags.
+
+
+### v1.0.4
+- Full-season sync begins on 7 September 2026 instead of a rolling lookback.
+- Adds Holdsport `AVAILABLE`, `SELECTED`, `VACATION`, `UNAVAILABLE`, and `INJURED` handling; for KSV D3, `AVAILABLE` and `INJURED` are treated as match-support attendance rather than playing-roster selection.
+- Adds Secretary duty as a distinct event type.
+- Imports Holdsport task capacity (`max_participants`) so a two-person secretary duty is tracked as two required slots, not as an obligation for the whole roster.
