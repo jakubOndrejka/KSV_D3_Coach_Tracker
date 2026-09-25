@@ -11,7 +11,7 @@
  */
 
 const KSV = {
-  VERSION: '1.0.0',
+  VERSION: '1.0.1',
   DEFAULT_SEASON_START: '2026-08-01',
   SESSION_HOURS: 12,
   DEFAULT_LOOKBACK_DAYS: 21,
@@ -109,6 +109,7 @@ function doGet() {
 
 function doPost(e) {
   const requestId = (e && e.parameter && e.parameter.request_id) ? String(e.parameter.request_id) : '';
+  const bridgeKey = (e && e.parameter && e.parameter.bridge_key) ? String(e.parameter.bridge_key) : '';
   try {
     const raw = (e && e.parameter && e.parameter.payload) ? e.parameter.payload : '{}';
     const req = JSON.parse(raw);
@@ -125,9 +126,9 @@ function doPost(e) {
       result = dispatchAuthenticated_(action, data);
     }
 
-    return bridgeResponse_(requestId, { ok: true, result: result, version: KSV.VERSION });
+    return bridgeResponse_(requestId, bridgeKey, { ok: true, result: result, version: KSV.VERSION });
   } catch (err) {
-    return bridgeResponse_(requestId, {
+    return bridgeResponse_(requestId, bridgeKey, {
       ok: false,
       error: err && err.message ? err.message : String(err),
       version: KSV.VERSION
@@ -655,16 +656,25 @@ function defaultIncludeForRole_(role) {
   return [1, 4, 6].includes(Number(role));
 }
 
-function bridgeResponse_(requestId, payload) {
+function bridgeResponse_(requestId, bridgeKey, payload) {
   const encoded = Utilities.base64EncodeWebSafe(JSON.stringify(payload), Utilities.Charset.UTF_8);
   const rid = JSON.stringify(String(requestId || ''));
+  const bkey = JSON.stringify(String(bridgeKey || ''));
   const html = '<!doctype html><html><head><meta charset="utf-8"></head><body><script>' +
-    '(function(){try{' +
-    'var s=' + JSON.stringify(encoded) + ';s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";' +
-    'var bin=atob(s),bytes=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);' +
-    'var json=new TextDecoder("utf-8").decode(bytes);' +
-    'parent.postMessage({__ksvBridge:true,requestId:' + rid + ',payload:JSON.parse(json)},"*");' +
-    '}catch(e){parent.postMessage({__ksvBridge:true,requestId:' + rid + ',payload:{ok:false,error:String(e)}},"*");}})();' +
+    '(function(){' +
+    'function send(message){' +
+      'try{if(window.top&&window.top!==window)window.top.postMessage(message,"*");}catch(_e){}' +
+      'try{if(window.parent&&window.parent!==window)window.parent.postMessage(message,"*");}catch(_e){}' +
+    '}' +
+    'try{' +
+      'var s=' + JSON.stringify(encoded) + ';s=s.replace(/-/g,"+").replace(/_/g,"/");while(s.length%4)s+="=";' +
+      'var bin=atob(s),bytes=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++)bytes[i]=bin.charCodeAt(i);' +
+      'var json=new TextDecoder("utf-8").decode(bytes);' +
+      'send({__ksvBridge:true,requestId:' + rid + ',bridgeKey:' + bkey + ',payload:JSON.parse(json)});' +
+    '}catch(e){' +
+      'send({__ksvBridge:true,requestId:' + rid + ',bridgeKey:' + bkey + ',payload:{ok:false,error:String(e)}});' +
+    '}' +
+    '})();' +
     '</script></body></html>';
   return HtmlService.createHtmlOutput(html).setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }

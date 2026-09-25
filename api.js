@@ -54,6 +54,10 @@
       if (!backendUrl) throw new Error('Backend URL is not configured.');
 
       const requestId = 'r_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2);
+      // Apps Script HTML Service can add an internal iframe around the returned page.
+      // A random bridge key lets us safely accept the reply even when event.source
+      // is the inner Google frame rather than the iframe element we created here.
+      const bridgeKey = 'b_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
       const token = options.auth === false ? '' : this.getToken();
       if (options.auth !== false && !token) throw new Error('Please sign in first.');
 
@@ -82,8 +86,14 @@
         requestInput.name = 'request_id';
         requestInput.value = requestId;
 
+        const bridgeInput = document.createElement('input');
+        bridgeInput.type = 'hidden';
+        bridgeInput.name = 'bridge_key';
+        bridgeInput.value = bridgeKey;
+
         form.appendChild(payloadInput);
         form.appendChild(requestInput);
+        form.appendChild(bridgeInput);
         document.body.appendChild(iframe);
         document.body.appendChild(form);
 
@@ -98,9 +108,8 @@
         };
 
         const onMessage = (event) => {
-          if (event.source !== iframe.contentWindow) return;
           const msg = event.data;
-          if (!msg || msg.__ksvBridge !== true || msg.requestId !== requestId) return;
+          if (!msg || msg.__ksvBridge !== true || msg.requestId !== requestId || msg.bridgeKey !== bridgeKey) return;
           if (settled) return;
           settled = true;
           cleanup();

@@ -343,6 +343,8 @@ You can keep the same `/exec` URL.
 
 ### "Backend request timed out"
 
+If you previously uploaded **v1.0.0**, replace `api.js`, `sw.js`, and `backend/Code.gs` with the v1.0.1 files, then redeploy Apps Script as a **new version**. v1.0.0 had an iframe bridge bug that could produce this timeout even when the password and deployment were correct.
+
 Most likely:
 
 - the Web App URL is wrong;
