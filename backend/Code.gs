@@ -11,7 +11,7 @@
  */
 
 const KSV = {
-  VERSION: '1.0.6',
+  VERSION: '1.0.7',
   DEFAULT_SEASON_START: '2026-09-07',
   SESSION_HOURS: 12,
   DEFAULT_LOOKBACK_DAYS: 21,
@@ -1227,6 +1227,60 @@ function diagnosticActivityTasks_(activities) {
   return out;
 }
 
+
+/**
+ * Diagnostic for Holdsport's "On vacation" state.
+ * The documented REST API has no vacation endpoint/status. This helper compares
+ * the active team roster with each activity's explicit + no_rsvp lists so you can
+ * see which members Holdsport omitted entirely. Run it on a date/activity where
+ * the Holdsport UI visibly shows "On vacation" and compare the names.
+ * It makes NO changes to tracker data.
+ */
+function debugHoldsportVacationCandidates() {
+  const props = PropertiesService.getScriptProperties();
+  const teamId = props.getProperty('HOLDSPORT_TEAM_ID');
+  if (!teamId) throw new Error('HOLDSPORT_TEAM_ID is not configured.');
+  const seasonStart = props.getProperty('SEASON_START') || KSV.DEFAULT_SEASON_START;
+  const rawMembers = holdsportFetch_('/v1/teams/' + encodeURIComponent(teamId) + '/members');
+  const members = holdsportArray_(rawMembers, ['members','team_members','users','data','items']) || [];
+  const roster = members.filter(m => [1,4].includes(Number(firstDefined_(m.role,m.team_role,1))));
+  const fetched = fetchAllHoldsportActivities_(teamId, seasonStart, 50, 6).activities;
+  const now = Date.now();
+  const sample = fetched.filter(a => {
+    const d = parseHoldsportDate_(holdsportActivityStart_(a));
+    return d && Math.abs(d.getTime() - now) <= 35 * 86400000;
+  }).slice(0, 20);
+  const report = sample.map(activity => {
+    const activityId = holdsportActivityId_(activity);
+    let users = holdsportArray_(activity.activities_users, ['activities_users','users','data','items']) || [];
+    if (!users.length) {
+      try {
+        const raw = holdsportFetch_('/v1/activities/' + encodeURIComponent(activityId) + '/activities_users');
+        users = holdsportArray_(raw, ['activities_users','users','data','items']) || [];
+      } catch (_err) {}
+    }
+    const noRsvp = holdsportArray_(firstDefined_(activity.no_rsvp, activity.no_response, activity.no_responses, []), ['no_rsvp','users','data','items']) || [];
+    const seen = {};
+    users.forEach(u => { const id=holdsportActivityUserId_(u); if(id) seen[String(id)] = true; });
+    noRsvp.forEach(u => { const id=holdsportMemberId_(u); if(id) seen[String(id)] = true; });
+    const omitted = roster.filter(m => !seen[String(holdsportMemberId_(m))]).map(m => ({
+      id: holdsportMemberId_(m),
+      name: holdsportMemberName_(m),
+      role: firstDefined_(m.role,m.team_role,'')
+    }));
+    return {
+      activity_id: activityId,
+      date: normalizeHoldsportDateForStorage_(holdsportActivityStart_(activity)),
+      name: String(firstDefined_(activity.name, activity.title, '')),
+      explicit_count: users.length,
+      no_rsvp_count: noRsvp.length,
+      omitted_members: omitted
+    };
+  });
+  const out = { version:KSV.VERSION, note:'Omitted does NOT automatically mean vacation. Compare with Holdsport UI before inferring.', activities:report };
+  Logger.log(JSON.stringify(out, null, 2));
+  return out;
+}
 
 function roleName_(role) {
   const map = { 1: 'player', 2: 'coach', 3: 'assistant coach', 4: 'injured', 5: 'inactive', 6: 'team leader' };

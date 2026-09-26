@@ -61,7 +61,7 @@ One row per Holdsport task definition on an event. Stores the task name, Holdspo
 
 The frontend also keeps a short-lived browser-side pending attendance queue. This is not a second database: it exists only to make session taps immediate and to retry unsaved changes if Apps Script/Google Sheets is slow or the connection drops.
 
-## v1.0.6 interpretation
+## v1.0.7 interpretation
 
 Attendance comparison is derived in the frontend from `Participation.actual_attendance` and `Events.auto_type/manual_type`; no new Sheet is required. Position remains `Players.position` and is coach-entered.
 

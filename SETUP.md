@@ -405,7 +405,7 @@ If upgrading from v1.0.4, replace the frontend files and `backend/Code.gs`, then
 
 Session attendance now saves optimistically: a tap updates the screen immediately, then changes are batched to Google Sheets after a short delay. Pending changes are stored in the browser and retried after temporary network/backend failures.
 
-## v1.0.6 update notes
+## v1.0.7 update notes
 
 Replace the frontend files and `backend/Code.gs`, redeploy the Apps Script web app as a **New version**, then sync Holdsport once. No Sheet recreation or `initializeProject()` rerun is required.
 

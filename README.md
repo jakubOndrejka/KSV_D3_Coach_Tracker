@@ -85,7 +85,7 @@ The official Holdsport repository documents Basic Authentication and the endpoin
 - Adds Secretary duty as a distinct event type.
 - Imports Holdsport task capacity (`max_participants`) so a two-person secretary duty is tracked as two required slots, not as an obligation for the whole roster.
 
-## v1.0.6 attendance design
+## v1.0.7 attendance design
 
 - Adds a dedicated **Attendance** tab grouped by volleyball position (S, OH, MB, OPP, L).
 - Player overview now separates attendance by event type, e.g. `4/6 practice · 2/2 match`.
@@ -94,3 +94,12 @@ The official Holdsport repository documents Basic Authentication and the endpoin
 - Volleyball positions are edited manually because the live KSV Holdsport member payload does not expose them.
 - For KSV matches using `registration_type=2`, live REST semantics are mapped as: status code `1` = selected roster, status code `5` in `activities_users` = available/not selected, while `no_rsvp` remains undecided.
 - If the legacy REST response cannot distinguish a Holdsport vacation from another non-response state, the coach can set participation **Context = vacation**; bulk-present then skips that player and the row is treated as not expected.
+
+
+## v1.0.7 attendance + position colours
+
+- Player positions remain manual because Holdsport's public REST member response does not expose KSV's member-colour assignment. The UI now mirrors KSV's Holdsport colours: Outside `#00ac01`, Middle `#ffff20`, Libero `#1921c6`, Setter `#e8bf20`, Diagonal `#20e8df`.
+- Attendance percentages now use **all past practices/matches in the selected window** as the denominator.
+- Attendance bars are stacked into present, late, unregistered/unavailable, vacation, excused/injured, no-show/unexcused, and unmarked.
+- Added 15-day filters to player and position attendance views.
+- Added `debugHoldsportVacationCandidates()` to investigate Holdsport's UI-only **On vacation** category without guessing or changing data.
